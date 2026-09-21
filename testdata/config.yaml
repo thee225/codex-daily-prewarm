@@ -1,0 +1,26 @@
+host: ""
+port: 8317
+remote-management:
+  allow-remote: false
+  secret-key: "isolated-test-only"
+  disable-control-panel: true
+auth-dir: "/tmp/cpa-auths"
+api-keys:
+  - "isolated-test-api-key"
+debug: false
+logging-to-file: false
+plugins:
+  enabled: true
+  dir: "/tmp/cpa-plugins"
+  configs:
+    codex-daily-prewarm:
+      enabled: true
+      automatic_enabled: false
+      schedule: "0 6 * * *"
+      timezone: "Asia/Shanghai"
+      model: "gpt-5.6-luna"
+      prompt: "hi"
+      expected_account_count: 3
+      account_spacing: "30s"
+      retry_count: 1
+      state_path: "/tmp/cpa-plugins/state/codex-daily-prewarm.json"
