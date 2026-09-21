@@ -100,6 +100,22 @@ type envelopeError struct {
 	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
+type hostCallbackError struct {
+	Code       string
+	Message    string
+	HTTPStatus int
+}
+
+func (e *hostCallbackError) Error() string {
+	if e == nil {
+		return "host callback failed"
+	}
+	if e.Code != "" {
+		return "host callback failed: " + e.Code
+	}
+	return "host callback failed"
+}
+
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
@@ -252,8 +268,12 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("decode host callback %s: %w", method, err)
 	}
 	if !env.OK || code != 0 {
-		if env.Error != nil && env.Error.Code != "" {
-			return nil, fmt.Errorf("host callback %s failed: %s", method, env.Error.Code)
+		if env.Error != nil {
+			return nil, &hostCallbackError{
+				Code:       env.Error.Code,
+				Message:    env.Error.Message,
+				HTTPStatus: env.Error.HTTPStatus,
+			}
 		}
 		return nil, fmt.Errorf("host callback %s failed, code=%d", method, int(code))
 	}

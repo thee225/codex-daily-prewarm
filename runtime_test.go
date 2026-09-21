@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,6 +53,28 @@ func TestPrimaryResetAt(t *testing.T) {
 	headers.Set("X-Codex-Primary-Reset-At", "1790000000")
 	if got := primaryResetAt(headers, now); got.Unix() != 1790000000 {
 		t.Fatalf("reset = %v", got)
+	}
+}
+
+func TestUpstreamUsageLimitDetails(t *testing.T) {
+	now := time.Date(2026, 9, 21, 6, 0, 0, 0, time.UTC)
+	message := `{"error":{"type":"usage_limit_reached","resets_at":1790129498,"resets_in_seconds":156515}}`
+	if got := upstreamResetAt(message, now); got.Unix() != 1790129498 {
+		t.Fatalf("reset = %v", got)
+	}
+	if got := upstreamErrorCode(message, http.StatusTooManyRequests); got != "usage_limit_reached" {
+		t.Fatalf("error code = %q", got)
+	}
+	if safeToRetryStatus(http.StatusTooManyRequests) {
+		t.Fatal("usage-limit 429 must not be retried")
+	}
+}
+
+func TestHostCallbackErrorClassification(t *testing.T) {
+	err := &hostCallbackError{Code: "host_call_failed", Message: `{}`, HTTPStatus: http.StatusTooManyRequests}
+	var got *hostCallbackError
+	if !errors.As(err, &got) || got.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("host callback error = %#v", got)
 	}
 }
 

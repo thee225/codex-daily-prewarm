@@ -322,6 +322,17 @@ func executeAccount(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) accountR
 			},
 		})
 		if callErr != nil {
+			var hostErr *hostCallbackError
+			if errors.As(callErr, &hostErr) && hostErr.HTTPStatus > 0 {
+				result.StatusCode = hostErr.HTTPStatus
+				result.PrimaryResetAt = upstreamResetAt(hostErr.Message, time.Now())
+				result.ErrorCode = upstreamErrorCode(hostErr.Message, hostErr.HTTPStatus)
+				if attempt >= cfg.RetryCount || !safeToRetryStatus(hostErr.HTTPStatus) {
+					break
+				}
+				time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+				continue
+			}
 			// The host callback may have reached the provider before returning an
 			// error, so repeating it could consume twice. Treat it as uncertain.
 			result.ErrorCode = "model_execution_uncertain"
@@ -409,6 +420,42 @@ func primaryResetAt(headers http.Header, now time.Time) time.Time {
 	return time.Time{}
 }
 
+func upstreamResetAt(message string, now time.Time) time.Time {
+	if len(message) == 0 || len(message) > 16<<10 || !json.Valid([]byte(message)) {
+		return time.Time{}
+	}
+	var payload struct {
+		Error struct {
+			ResetsAt        int64 `json:"resets_at"`
+			ResetsInSeconds int64 `json:"resets_in_seconds"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return time.Time{}
+	}
+	if payload.Error.ResetsAt > 0 {
+		return time.Unix(payload.Error.ResetsAt, 0).UTC()
+	}
+	if seconds := payload.Error.ResetsInSeconds; seconds > 0 && seconds <= 45*24*60*60 {
+		return now.Add(time.Duration(seconds) * time.Second).UTC()
+	}
+	return time.Time{}
+}
+
+func upstreamErrorCode(message string, status int) string {
+	if status == http.StatusTooManyRequests && len(message) <= 16<<10 && json.Valid([]byte(message)) {
+		var payload struct {
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(message), &payload) == nil && payload.Error.Type == "usage_limit_reached" {
+			return "usage_limit_reached"
+		}
+	}
+	return statusErrorCode(status)
+}
+
 func boundedHeader(headers http.Header, name string) string {
 	value := strings.TrimSpace(headers.Get(name))
 	if len(value) > 128 {
@@ -426,7 +473,7 @@ func statusErrorCode(status int) string {
 
 func safeToRetryStatus(status int) bool {
 	switch status {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false
