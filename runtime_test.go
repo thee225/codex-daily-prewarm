@@ -108,3 +108,61 @@ func TestAccountFingerprintDoesNotExposeAuthID(t *testing.T) {
 		t.Fatalf("fingerprint = %q", fingerprint)
 	}
 }
+
+func TestJobDailyKeysAreIndependentAndLegacyCompatible(t *testing.T) {
+	account := "acct-123"
+	if dailyKey("default", account) != account {
+		t.Fatal("legacy daily state must remain readable")
+	}
+	if dailyKey("evening", account) == dailyKey("default", account) {
+		t.Fatal("different jobs must not share daily completion")
+	}
+}
+
+func TestFirstUseOnlyRespondsToSuccessfulExternalCodexUsage(t *testing.T) {
+	valid := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true}
+	if !eligibleFirstUse(valid) {
+		t.Fatal("successful external Codex request should trigger")
+	}
+	for name, mutate := range map[string]func(*pluginapi.UsageRecord){
+		"own callback":   func(r *pluginapi.UsageRecord) { r.APIKey = "" },
+		"failed":         func(r *pluginapi.UsageRecord) { r.Failed = true },
+		"other provider": func(r *pluginapi.UsageRecord) { r.Provider = "gemini" },
+		"no auth":        func(r *pluginapi.UsageRecord) { r.AuthID = "" },
+		"no generation":  func(r *pluginapi.UsageRecord) { r.Generate = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := valid
+			mutate(&record)
+			if eligibleFirstUse(record) {
+				t.Fatal("unexpected first-use trigger")
+			}
+		})
+	}
+}
+
+func TestFirstUseStartsOneRoundAndPersistsCooldown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	r := newRuntime()
+	if err := r.configure([]byte("sync_on_first_use: true\nstate_path: " + path + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	record := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true}
+	r.handleUsage(record)
+	r.handleUsage(record)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(r.history()) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	history := r.history()
+	if len(history) != 1 || history[0].Trigger != "first_use" || history[0].Job != "first-use" {
+		t.Fatalf("unexpected history = %#v", history)
+	}
+	state, err := readState(path)
+	if err != nil || state.LastSyncAt.IsZero() {
+		t.Fatalf("sync state was not persisted: %#v, %v", state, err)
+	}
+}

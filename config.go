@@ -21,6 +21,7 @@ const (
 
 type pluginConfig struct {
 	AutomaticEnabled     bool           `json:"automatic_enabled"`
+	SyncOnFirstUse       bool           `json:"sync_on_first_use"`
 	Schedule             string         `json:"schedule"`
 	Timezone             string         `json:"timezone"`
 	Model                string         `json:"model"`
@@ -31,18 +32,36 @@ type pluginConfig struct {
 	StatePath            string         `json:"state_path"`
 	Location             *time.Location `json:"-"`
 	CronSchedule         cron.Schedule  `json:"-"`
+	Jobs                 []prewarmJob   `json:"-"`
+}
+
+type prewarmJob struct {
+	Name         string
+	Schedule     string
+	Model        string
+	Prompt       string
+	CronSchedule cron.Schedule
+}
+
+type yamlPrewarmJob struct {
+	Name     string `yaml:"name"`
+	Schedule string `yaml:"schedule"`
+	Model    string `yaml:"model"`
+	Prompt   string `yaml:"prompt"`
 }
 
 type yamlPluginConfig struct {
-	AutomaticEnabled     *bool  `yaml:"automatic_enabled"`
-	Schedule             string `yaml:"schedule"`
-	Timezone             string `yaml:"timezone"`
-	Model                string `yaml:"model"`
-	Prompt               string `yaml:"prompt"`
-	ExpectedAccountCount *int   `yaml:"expected_account_count"`
-	AccountSpacing       string `yaml:"account_spacing"`
-	RetryCount           *int   `yaml:"retry_count"`
-	StatePath            string `yaml:"state_path"`
+	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
+	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"`
+	Schedule             string           `yaml:"schedule"`
+	Timezone             string           `yaml:"timezone"`
+	Model                string           `yaml:"model"`
+	Prompt               string           `yaml:"prompt"`
+	ExpectedAccountCount *int             `yaml:"expected_account_count"`
+	AccountSpacing       string           `yaml:"account_spacing"`
+	RetryCount           *int             `yaml:"retry_count"`
+	StatePath            string           `yaml:"state_path"`
+	Jobs                 []yamlPrewarmJob `yaml:"jobs"`
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -60,6 +79,7 @@ func defaultPluginConfig() pluginConfig {
 		StatePath:            defaultStatePath,
 		Location:             location,
 		CronSchedule:         schedule,
+		Jobs:                 []prewarmJob{{Name: "default", Schedule: defaultSchedule, Model: defaultModel, Prompt: defaultPrompt, CronSchedule: schedule}},
 	}
 }
 
@@ -74,6 +94,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if input.AutomaticEnabled != nil {
 		cfg.AutomaticEnabled = *input.AutomaticEnabled
+	}
+	if input.SyncOnFirstUse != nil {
+		cfg.SyncOnFirstUse = *input.SyncOnFirstUse
 	}
 	if value := strings.TrimSpace(input.Schedule); value != "" {
 		cfg.Schedule = value
@@ -127,13 +150,66 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		return cfg, fmt.Errorf("timezone: %w", err)
 	}
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := parser.Parse(cfg.Schedule)
-	if err != nil {
-		return cfg, fmt.Errorf("schedule must be a standard five-field cron expression: %w", err)
+	if len(input.Jobs) > 0 && strings.TrimSpace(input.Schedule) != "" {
+		return cfg, fmt.Errorf("use either schedule or jobs, not both")
+	}
+	if len(input.Jobs) > 16 {
+		return cfg, fmt.Errorf("jobs must contain at most 16 entries")
+	}
+	if len(input.Jobs) == 0 {
+		schedule, err := parser.Parse(cfg.Schedule)
+		if err != nil {
+			return cfg, fmt.Errorf("schedule must be a standard five-field cron expression: %w", err)
+		}
+		cfg.CronSchedule = schedule
+		cfg.Jobs = []prewarmJob{{Name: "default", Schedule: cfg.Schedule, Model: cfg.Model, Prompt: cfg.Prompt, CronSchedule: schedule}}
+	} else {
+		cfg.Jobs = make([]prewarmJob, 0, len(input.Jobs))
+		seen := make(map[string]bool)
+		for _, item := range input.Jobs {
+			name := strings.TrimSpace(item.Name)
+			if !validJobName(name) || seen[name] {
+				return cfg, fmt.Errorf("job names must be unique and use 1-64 letters, digits, underscores or hyphens")
+			}
+			seen[name] = true
+			scheduleText := strings.TrimSpace(item.Schedule)
+			schedule, err := parser.Parse(scheduleText)
+			if err != nil {
+				return cfg, fmt.Errorf("job %s schedule must be a standard five-field cron expression: %w", name, err)
+			}
+			model := cfg.Model
+			if strings.TrimSpace(item.Model) != "" {
+				model = strings.TrimSpace(item.Model)
+			}
+			if err := validateModel(model); err != nil {
+				return cfg, fmt.Errorf("job %s: %w", name, err)
+			}
+			prompt := cfg.Prompt
+			if item.Prompt != "" {
+				prompt = item.Prompt
+			}
+			if !utf8.ValidString(prompt) || strings.TrimSpace(prompt) == "" || len([]byte(prompt)) > 1024 {
+				return cfg, fmt.Errorf("job %s prompt must be valid UTF-8 between 1 and 1024 bytes", name)
+			}
+			cfg.Jobs = append(cfg.Jobs, prewarmJob{Name: name, Schedule: scheduleText, Model: model, Prompt: prompt, CronSchedule: schedule})
+		}
+		cfg.Schedule = ""
+		cfg.CronSchedule = nil
 	}
 	cfg.Location = location
-	cfg.CronSchedule = schedule
 	return cfg, nil
+}
+
+func validJobName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if !(r == '-' || r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 func validateModel(model string) error {
@@ -150,20 +226,34 @@ func validateModel(model string) error {
 }
 
 type publicConfig struct {
-	AutomaticEnabled     bool   `json:"automatic_enabled"`
-	Schedule             string `json:"schedule"`
-	Timezone             string `json:"timezone"`
-	Model                string `json:"model"`
-	PromptSummary        string `json:"prompt_summary"`
-	ExpectedAccountCount int    `json:"expected_account_count"`
-	AccountSpacing       string `json:"account_spacing"`
-	RetryCount           int    `json:"retry_count"`
-	StatePath            string `json:"state_path"`
+	AutomaticEnabled     bool        `json:"automatic_enabled"`
+	SyncOnFirstUse       bool        `json:"sync_on_first_use"`
+	Schedule             string      `json:"schedule"`
+	Timezone             string      `json:"timezone"`
+	Model                string      `json:"model"`
+	PromptSummary        string      `json:"prompt_summary"`
+	ExpectedAccountCount int         `json:"expected_account_count"`
+	AccountSpacing       string      `json:"account_spacing"`
+	RetryCount           int         `json:"retry_count"`
+	StatePath            string      `json:"state_path"`
+	Jobs                 []publicJob `json:"jobs"`
+}
+
+type publicJob struct {
+	Name          string `json:"name"`
+	Schedule      string `json:"schedule"`
+	Model         string `json:"model"`
+	PromptSummary string `json:"prompt_summary"`
 }
 
 func (cfg pluginConfig) public() publicConfig {
+	jobs := make([]publicJob, 0, len(cfg.Jobs))
+	for _, job := range cfg.Jobs {
+		jobs = append(jobs, publicJob{Name: job.Name, Schedule: job.Schedule, Model: job.Model, PromptSummary: fmt.Sprintf("configured (%d bytes)", len([]byte(job.Prompt)))})
+	}
 	return publicConfig{
 		AutomaticEnabled:     cfg.AutomaticEnabled,
+		SyncOnFirstUse:       cfg.SyncOnFirstUse,
 		Schedule:             cfg.Schedule,
 		Timezone:             cfg.Timezone,
 		Model:                cfg.Model,
@@ -172,5 +262,6 @@ func (cfg pluginConfig) public() publicConfig {
 		AccountSpacing:       cfg.AccountSpacing.String(),
 		RetryCount:           cfg.RetryCount,
 		StatePath:            cfg.StatePath,
+		Jobs:                 jobs,
 	}
 }

@@ -44,16 +44,33 @@ func TestHostEnabledDoesNotEnableAutomaticSchedule(t *testing.T) {
 
 func TestParsePluginConfigRejectsUnsafeValues(t *testing.T) {
 	for name, raw := range map[string]string{
-		"cron":     "schedule: '* * *'",
-		"timezone": "timezone: Mars/Olympus",
-		"model":    "model: 'gpt 5'",
-		"state":    "state_path: relative.json",
-		"count":    "expected_account_count: -1",
+		"cron":            "schedule: '* * *'",
+		"timezone":        "timezone: Mars/Olympus",
+		"model":           "model: 'gpt 5'",
+		"state":           "state_path: relative.json",
+		"count":           "expected_account_count: -1",
+		"mixed schedules": "schedule: '0 6 * * *'\njobs:\n  - name: noon\n    schedule: '0 12 * * *'",
+		"duplicate jobs":  "jobs:\n  - name: morning\n    schedule: '0 6 * * *'\n  - name: morning\n    schedule: '0 12 * * *'",
+		"invalid job":     "jobs:\n  - name: bad/job\n    schedule: '0 6 * * *'",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parsePluginConfig([]byte(raw)); err == nil {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestParseMultipleJobs(t *testing.T) {
+	raw := []byte("automatic_enabled: true\nsync_on_first_use: true\ntimezone: Asia/Shanghai\nmodel: gpt-5.6-luna\nprompt: hi\njobs:\n  - name: default\n    schedule: '0 6 * * *'\n  - name: evening\n    schedule: '0 18 * * *'\n    model: gpt-5.4\n    prompt: hello\n")
+	cfg, err := parsePluginConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SyncOnFirstUse || len(cfg.Jobs) != 2 || cfg.Jobs[0].Model != "gpt-5.6-luna" || cfg.Jobs[1].Model != "gpt-5.4" || cfg.Jobs[1].Prompt != "hello" {
+		t.Fatalf("jobs = %#v", cfg.Jobs)
+	}
+	if got := cfg.Jobs[1].CronSchedule.Next(time.Date(2026, 9, 23, 17, 0, 0, 0, cfg.Location)); got.Hour() != 18 {
+		t.Fatalf("evening next = %s", got)
 	}
 }

@@ -26,13 +26,15 @@ const (
 )
 
 type runtimeState struct {
-	Version int                        `json:"version"`
-	Daily   map[string]map[string]bool `json:"daily,omitempty"`
-	History []runRecord                `json:"history,omitempty"`
+	Version    int                        `json:"version"`
+	Daily      map[string]map[string]bool `json:"daily,omitempty"`
+	History    []runRecord                `json:"history,omitempty"`
+	LastSyncAt time.Time                  `json:"last_sync_at,omitempty"`
 }
 
 type runRecord struct {
 	ID         string          `json:"id"`
+	Job        string          `json:"job,omitempty"`
 	Trigger    string          `json:"trigger"`
 	Force      bool            `json:"force"`
 	Date       string          `json:"date"`
@@ -72,14 +74,32 @@ type runtimeStatus struct {
 	LastError   string       `json:"last_error,omitempty"`
 	LastRun     *runRecord   `json:"last_run,omitempty"`
 	HistorySize int          `json:"history_size"`
+	NextRuns    []jobNextRun `json:"next_runs,omitempty"`
+	LastSyncAt  time.Time    `json:"last_sync_at,omitempty"`
+}
+
+type jobNextRun struct {
+	Name      string    `json:"name"`
+	Schedule  string    `json:"schedule"`
+	Model     string    `json:"model"`
+	NextRunAt time.Time `json:"next_run_at"`
+}
+
+type runRequest struct {
+	Trigger      string
+	Job          prewarmJob
+	Force        bool
+	SourceAuthID string
 }
 
 type runtime struct {
 	mu        sync.RWMutex
+	persistMu sync.Mutex
 	cfg       pluginConfig
 	cron      *cron.Cron
 	state     runtimeState
 	running   bool
+	pending   []runRequest
 	closed    bool
 	lastError string
 }
@@ -138,13 +158,16 @@ func (r *runtime) configure(raw []byte) error {
 	r.lastError = ""
 	if cfg.AutomaticEnabled {
 		c := cron.New(cron.WithLocation(cfg.Location))
-		if _, err := c.AddFunc(cfg.Schedule, func() {
-			if err := r.startRun("schedule", false); err != nil && !errors.Is(err, errAlreadyRunning) {
-				r.setLastError(safeErrorCode(err))
+		for _, job := range cfg.Jobs {
+			job := job
+			if _, err := c.AddFunc(job.Schedule, func() {
+				if err := r.startRunJob(runRequest{Trigger: "schedule", Job: job}); err != nil {
+					r.setLastError(safeErrorCode(err))
+				}
+			}); err != nil {
+				r.mu.Unlock()
+				return fmt.Errorf("register job %s: %w", job.Name, err)
 			}
-		}); err != nil {
-			r.mu.Unlock()
-			return fmt.Errorf("register schedule: %w", err)
 		}
 		r.cron = c
 		c.Start()
@@ -168,42 +191,81 @@ func (r *runtime) shutdown() {
 }
 
 var errAlreadyRunning = errors.New("prewarm is already running")
+var errJobNotFound = errors.New("prewarm job not found")
 
 func (r *runtime) startRun(trigger string, force bool) error {
+	return r.startNamedRun(trigger, "", force)
+}
+
+func (r *runtime) startNamedRun(trigger, name string, force bool) error {
+	r.mu.RLock()
+	jobs := r.cfg.Jobs
+	r.mu.RUnlock()
+	if name == "" && len(jobs) > 0 {
+		name = jobs[0].Name
+	}
+	for _, job := range jobs {
+		if job.Name == name {
+			return r.startRunJob(runRequest{Trigger: trigger, Job: job, Force: force})
+		}
+	}
+	return errJobNotFound
+}
+
+func (r *runtime) startRunJob(request runRequest) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return errors.New("plugin is shutting down")
 	}
 	if r.running {
+		if request.Trigger == "schedule" || request.Trigger == "first_use" {
+			r.pending = append(r.pending, request)
+			r.mu.Unlock()
+			return nil
+		}
 		r.mu.Unlock()
 		return errAlreadyRunning
 	}
 	r.running = true
 	r.lastError = ""
-	cfg := r.cfg
 	r.mu.Unlock()
 
-	go func() {
-		record := r.executeRun(cfg, trigger, force)
-		r.mu.Lock()
-		r.running = false
-		if record.ErrorCode != "" {
-			r.lastError = record.ErrorCode
-		}
-		r.mu.Unlock()
-	}()
+	go r.runQueue(request)
 	return nil
 }
 
-func (r *runtime) executeRun(cfg pluginConfig, trigger string, force bool) runRecord {
+func (r *runtime) runQueue(request runRequest) {
+	for {
+		r.mu.RLock()
+		cfg := r.cfg
+		r.mu.RUnlock()
+		record := r.executeRun(cfg, request)
+		r.mu.Lock()
+		if record.ErrorCode != "" {
+			r.lastError = record.ErrorCode
+		}
+		if len(r.pending) == 0 || r.closed {
+			r.pending = nil
+			r.running = false
+			r.mu.Unlock()
+			return
+		}
+		request = r.pending[0]
+		r.pending = r.pending[1:]
+		r.mu.Unlock()
+	}
+}
+
+func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	now := time.Now().In(cfg.Location)
 	record := runRecord{
 		ID:        fmt.Sprintf("%d", now.UnixNano()),
-		Trigger:   trigger,
-		Force:     force,
+		Job:       request.Job.Name,
+		Trigger:   request.Trigger,
+		Force:     request.Force,
 		Date:      now.Format("2006-01-02"),
-		Model:     cfg.Model,
+		Model:     request.Job.Model,
 		StartedAt: now,
 		Expected:  cfg.ExpectedAccountCount,
 	}
@@ -232,19 +294,19 @@ func (r *runtime) executeRun(cfg pluginConfig, trigger string, force bool) runRe
 
 	for index, auth := range auths {
 		fingerprint := accountFingerprint(auth.ID)
-		if !force && r.completedToday(record.Date, fingerprint) {
+		if auth.ID == request.SourceAuthID || (!request.Force && r.completedToday(record.Date, request.Job.Name, fingerprint)) {
 			record.Skipped++
 			continue
 		}
 		if record.Attempted > 0 && cfg.AccountSpacing > 0 {
 			time.Sleep(cfg.AccountSpacing)
 		}
-		result := executeAccount(cfg, auth)
+		result := executeAccount(cfg, request.Job, auth)
 		record.Attempted++
 		record.Accounts = append(record.Accounts, result)
 		if result.ResponseReceived {
 			record.Succeeded++
-			r.markCompleted(cfg, record.Date, fingerprint)
+			r.markCompleted(cfg, record.Date, request.Job.Name, fingerprint)
 		}
 		logHost("info", "codex daily prewarm account finished", map[string]any{
 			"account": fingerprint, "status": result.StatusCode, "response_received": result.ResponseReceived,
@@ -290,16 +352,16 @@ func eligibleCodexAuths(files []pluginapi.HostAuthFileEntry) []pluginapi.HostAut
 	return eligible
 }
 
-func executeAccount(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) accountResult {
+func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry) accountResult {
 	result := accountResult{
 		Account:     accountFingerprint(auth.ID),
 		AccountType: safeAccountType(auth.AccountType),
-		Model:       cfg.Model,
+		Model:       job.Model,
 		StartedAt:   time.Now().In(cfg.Location),
 	}
 	body, err := json.Marshal(chatCompletionRequest{
-		Model:    cfg.Model,
-		Messages: []chatMessage{{Role: "user", Content: cfg.Prompt}},
+		Model:    job.Model,
+		Messages: []chatMessage{{Role: "user", Content: job.Prompt}},
 	})
 	if err != nil {
 		result.ErrorCode = "request_encoding_failed"
@@ -313,7 +375,7 @@ func executeAccount(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) accountR
 			HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 				EntryProtocol:  "openai",
 				ExitProtocol:   "openai",
-				Model:          cfg.Model,
+				Model:          job.Model,
 				Stream:         false,
 				Body:           body,
 				Headers:        http.Header{"Content-Type": []string{"application/json"}},
@@ -505,13 +567,20 @@ func safeErrorCode(err error) string {
 	return "runtime_error"
 }
 
-func (r *runtime) completedToday(date, account string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.state.Daily[date] != nil && r.state.Daily[date][account]
+func dailyKey(job, account string) string {
+	if job == "default" {
+		return account // Preserve the v0.1 state for the original daily job.
+	}
+	return job + "/" + account
 }
 
-func (r *runtime) markCompleted(cfg pluginConfig, date, account string) {
+func (r *runtime) completedToday(date, job, account string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.Daily[date] != nil && r.state.Daily[date][dailyKey(job, account)]
+}
+
+func (r *runtime) markCompleted(cfg pluginConfig, date, job, account string) {
 	r.mu.Lock()
 	if r.state.Daily == nil {
 		r.state.Daily = make(map[string]map[string]bool)
@@ -519,11 +588,10 @@ func (r *runtime) markCompleted(cfg pluginConfig, date, account string) {
 	if r.state.Daily[date] == nil {
 		r.state.Daily[date] = make(map[string]bool)
 	}
-	r.state.Daily[date][account] = true
+	r.state.Daily[date][dailyKey(job, account)] = true
 	pruneDaily(r.state.Daily, time.Now().In(cfg.Location))
-	state := cloneState(r.state)
 	r.mu.Unlock()
-	if err := writeState(cfg.StatePath, state); err != nil {
+	if err := r.persistState(cfg.StatePath); err != nil {
 		r.setLastError("state_write_failed")
 	}
 }
@@ -534,12 +602,20 @@ func (r *runtime) appendRun(cfg pluginConfig, record runRecord) {
 	if len(r.state.History) > maxHistoryItems {
 		r.state.History = r.state.History[:maxHistoryItems]
 	}
-	state := cloneState(r.state)
 	r.mu.Unlock()
-	if err := writeState(cfg.StatePath, state); err != nil {
+	if err := r.persistState(cfg.StatePath); err != nil {
 		r.setLastError("state_write_failed")
 		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
 	}
+}
+
+func (r *runtime) persistState(path string) error {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	r.mu.RLock()
+	state := cloneState(r.state)
+	r.mu.RUnlock()
+	return writeState(path, state)
 }
 
 func (r *runtime) setLastError(code string) {
@@ -553,10 +629,16 @@ func (r *runtime) status() runtimeStatus {
 	defer r.mu.RUnlock()
 	status := runtimeStatus{
 		Plugin: pluginName, Version: pluginVersion, Config: r.cfg.public(), Running: r.running,
-		LastError: r.lastError, HistorySize: len(r.state.History),
+		LastError: r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
 	}
-	if r.cfg.AutomaticEnabled && r.cfg.CronSchedule != nil && r.cfg.Location != nil {
-		status.NextRunAt = r.cfg.CronSchedule.Next(time.Now().In(r.cfg.Location))
+	if r.cfg.AutomaticEnabled && r.cfg.Location != nil {
+		for _, job := range r.cfg.Jobs {
+			next := job.CronSchedule.Next(time.Now().In(r.cfg.Location))
+			status.NextRuns = append(status.NextRuns, jobNextRun{Name: job.Name, Schedule: job.Schedule, Model: job.Model, NextRunAt: next})
+			if status.NextRunAt.IsZero() || next.Before(status.NextRunAt) {
+				status.NextRunAt = next
+			}
+		}
 	}
 	if len(r.state.History) > 0 {
 		latest := r.state.History[0]
@@ -633,7 +715,7 @@ func writeState(path string, state runtimeState) error {
 }
 
 func cloneState(state runtimeState) runtimeState {
-	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), History: append([]runRecord(nil), state.History...)}
+	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
 	for date, accounts := range state.Daily {
 		clone.Daily[date] = make(map[string]bool, len(accounts))
 		for account, done := range accounts {
@@ -641,6 +723,35 @@ func cloneState(state runtimeState) runtimeState {
 		}
 	}
 	return clone
+}
+
+// handleUsage starts one synchronization round after the first successful
+// authenticated client request in a five-hour window. Host model callbacks
+// have no frontend API key, so this plugin cannot trigger itself recursively.
+func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
+	if !eligibleFirstUse(record) {
+		return
+	}
+	r.mu.Lock()
+	cfg := r.cfg
+	if r.closed || !cfg.SyncOnFirstUse || (!r.state.LastSyncAt.IsZero() && time.Since(r.state.LastSyncAt) < 5*time.Hour) {
+		r.mu.Unlock()
+		return
+	}
+	job := prewarmJob{Name: "first-use", Model: cfg.Model, Prompt: cfg.Prompt}
+	r.state.LastSyncAt = time.Now().In(cfg.Location)
+	r.mu.Unlock()
+	if err := r.persistState(cfg.StatePath); err != nil {
+		r.setLastError("state_write_failed")
+		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
+	}
+	if err := r.startRunJob(runRequest{Trigger: "first_use", Job: job, Force: true, SourceAuthID: record.AuthID}); err != nil {
+		r.setLastError(safeErrorCode(err))
+	}
+}
+
+func eligibleFirstUse(record pluginapi.UsageRecord) bool {
+	return strings.TrimSpace(record.APIKey) != "" && strings.EqualFold(record.Provider, "codex") && !record.Failed && record.Generate && strings.TrimSpace(record.AuthID) != ""
 }
 
 func pruneDaily(daily map[string]map[string]bool, now time.Time) {

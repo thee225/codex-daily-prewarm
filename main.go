@@ -129,6 +129,7 @@ type registration struct {
 
 type registrationCapabilities struct {
 	ManagementAPI bool `json:"management_api"`
+	UsagePlugin   bool `json:"usage_plugin"`
 }
 
 func main() {}
@@ -200,6 +201,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
+	case pluginabi.MethodUsageHandle:
+		var record pluginapi.UsageRecord
+		if err := json.Unmarshal(request, &record); err != nil {
+			return nil, fmt.Errorf("decode usage record: %w", err)
+		}
+		app.handleUsage(record)
+		return okEnvelope(map[string]any{"accepted": true})
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
 		app.shutdown()
 		return okEnvelope(map[string]any{"stopped": true})
@@ -218,7 +226,9 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://zuowode.com:8850/buyandhide/cpa-plugin-codex-daily-prewarm",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "automatic_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每日定时预热；宿主保留字段 enabled 仅控制插件是否加载。"},
+				{Name: "sync_on_first_use", Type: pluginapi.ConfigFieldTypeBoolean, Description: "首次外部 Codex 请求成功后，同步测试其余账号；五小时内只触发一轮。"},
 				{Name: "schedule", Type: pluginapi.ConfigFieldTypeString, Description: "标准五段 cron，例如每天 06:00 为 0 6 * * *。"},
+				{Name: "jobs", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的多时间段任务列表；每项含 name、schedule，可选 model 和 prompt。与 schedule 二选一。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "IANA 时区，例如 Asia/Shanghai。"},
 				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "预热模型，默认 gpt-5.6-luna。"},
 				{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "发送给模型的短提示词，默认 hi。"},
@@ -228,7 +238,7 @@ func pluginRegistration() registration {
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "不含凭据的运行状态文件。"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true},
 	}
 }
 
