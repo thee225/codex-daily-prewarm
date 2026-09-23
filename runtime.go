@@ -36,17 +36,22 @@ type runtimeState struct {
 // The old daily map remains readable for rollback, but decisions use the
 // observed, per-account reset time. A missing reset is never called confirmed.
 type accountWindow struct {
-	ResetAt         time.Time `json:"reset_at,omitempty"`
-	LastProbeAt     time.Time `json:"last_probe_at,omitempty"`
-	RetryAfter      time.Time `json:"retry_after,omitempty"`
-	LastSyncAt      time.Time `json:"last_sync_at,omitempty"`
-	LastSyncResetAt time.Time `json:"last_sync_reset_at,omitempty"`
+	ResetAt            time.Time   `json:"reset_at,omitempty"`
+	LastProbeAt        time.Time   `json:"last_probe_at,omitempty"`
+	RetryAfter         time.Time   `json:"retry_after,omitempty"`
+	LastSyncAt         time.Time   `json:"last_sync_at,omitempty"`
+	LastSyncResetAt    time.Time   `json:"last_sync_reset_at,omitempty"`
+	LastPrewarmAt      time.Time   `json:"last_prewarm_at,omitempty"`
+	LastPrewarmResetAt time.Time   `json:"last_prewarm_reset_at,omitempty"`
+	FiveHour           quotaWindow `json:"five_hour,omitempty"`
+	Weekly             quotaWindow `json:"weekly,omitempty"`
 }
 
 type runRecord struct {
 	ID                 string          `json:"id"`
 	Job                string          `json:"job,omitempty"`
 	Trigger            string          `json:"trigger"`
+	SourceAccount      string          `json:"source_account,omitempty"`
 	Force              bool            `json:"force"`
 	Date               string          `json:"date"`
 	Model              string          `json:"model"`
@@ -65,19 +70,21 @@ type runRecord struct {
 }
 
 type accountResult struct {
-	Account          string    `json:"account"`
-	AccountType      string    `json:"account_type,omitempty"`
-	Model            string    `json:"model"`
-	StartedAt        time.Time `json:"started_at"`
-	FinishedAt       time.Time `json:"finished_at"`
-	Attempts         int       `json:"attempts"`
-	StatusCode       int       `json:"status_code,omitempty"`
-	ResponseReceived bool      `json:"response_received"`
-	FallbackUsed     bool      `json:"fallback_used,omitempty"`
-	SkipReason       string    `json:"skip_reason,omitempty"`
-	PrimaryResetAt   time.Time `json:"primary_reset_at,omitempty"`
-	PrimaryUsed      string    `json:"primary_used_percent,omitempty"`
-	ErrorCode        string    `json:"error_code,omitempty"`
+	Account          string      `json:"account"`
+	AccountType      string      `json:"account_type,omitempty"`
+	Model            string      `json:"model"`
+	StartedAt        time.Time   `json:"started_at"`
+	FinishedAt       time.Time   `json:"finished_at"`
+	Attempts         int         `json:"attempts"`
+	StatusCode       int         `json:"status_code,omitempty"`
+	ResponseReceived bool        `json:"response_received"`
+	FallbackUsed     bool        `json:"fallback_used,omitempty"`
+	SkipReason       string      `json:"skip_reason,omitempty"`
+	PrimaryResetAt   time.Time   `json:"primary_reset_at,omitempty"`
+	PrimaryUsed      string      `json:"primary_used_percent,omitempty"`
+	FiveHour         quotaWindow `json:"five_hour,omitempty"`
+	Weekly           quotaWindow `json:"weekly,omitempty"`
+	ErrorCode        string      `json:"error_code,omitempty"`
 }
 
 type runtimeStatus struct {
@@ -108,15 +115,16 @@ type runRequest struct {
 }
 
 type runtime struct {
-	mu        sync.RWMutex
-	persistMu sync.Mutex
-	cfg       pluginConfig
-	cron      *cron.Cron
-	state     runtimeState
-	running   bool
-	pending   []runRequest
-	closed    bool
-	lastError string
+	mu                 sync.RWMutex
+	persistMu          sync.Mutex
+	cfg                pluginConfig
+	cron               *cron.Cron
+	state              runtimeState
+	running            bool
+	pending            []runRequest
+	closed             bool
+	lastError          string
+	lastQuotaPersistAt time.Time
 }
 
 type authListResponse struct {
@@ -284,6 +292,12 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		StartedAt: now,
 		Expected:  cfg.ExpectedAccountCount,
 	}
+	if request.SourceAuthID != "" {
+		record.SourceAccount = accountFingerprint(request.SourceAuthID)
+	}
+	if err := appendAuditEntry(cfg.StatePath, auditEntry{At: now, Event: "run_started", RunID: record.ID, Trigger: record.Trigger, Job: record.Job, SourceAccount: record.SourceAccount}); err != nil {
+		r.setLastError("audit_write_failed")
+	}
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)
 		record.Success = record.ErrorCode == "" && record.Succeeded+record.Skipped == record.Discovered && record.Discovered > 0
@@ -309,14 +323,16 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 
 	for index, auth := range auths {
 		fingerprint := accountFingerprint(auth.ID)
+		window := r.accountWindow(fingerprint)
 		if auth.ID == request.SourceAuthID {
 			record.Skipped++
+			record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: "source_account", FiveHour: window.FiveHour, Weekly: window.Weekly})
 			continue
 		}
 		if !request.Force {
 			if reason := r.skipReason(fingerprint, time.Now()); reason != "" {
 				record.Skipped++
-				record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: reason})
+				record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: reason, FiveHour: window.FiveHour, Weekly: window.Weekly})
 				continue
 			}
 		}
@@ -348,7 +364,7 @@ func (r *runtime) resetSpread(auths []pluginapi.HostAuthFileEntry, now time.Time
 	var earliest, latest time.Time
 	count := 0
 	for _, auth := range auths {
-		reset := r.state.Accounts[accountFingerprint(auth.ID)].ResetAt
+		reset := r.state.Accounts[accountFingerprint(auth.ID)].FiveHour.ResetAt
 		if !reset.After(now) {
 			continue
 		}
@@ -462,6 +478,7 @@ func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFil
 			}
 			result.StatusCode = response.StatusCode
 			result.PrimaryResetAt = primaryResetAt(response.Headers, time.Now())
+			result.FiveHour, result.Weekly = parseQuotaWindows(response.Headers, time.Now())
 			if result.PrimaryResetAt.IsZero() && response.StatusCode == http.StatusTooManyRequests {
 				result.PrimaryResetAt = upstreamResetAt(string(response.Body), time.Now())
 			}
@@ -665,26 +682,72 @@ func dailyKey(job, account string) string {
 func (r *runtime) skipReason(account string, now time.Time) string {
 	r.mu.RLock()
 	window := r.state.Accounts[account]
+	policy := normalizedUnknownQuotaPolicy(r.cfg.UnknownQuotaPolicy)
 	r.mu.RUnlock()
 	if now.Before(window.RetryAfter) {
 		return "quota_retry_pending"
 	}
-	if now.Before(window.ResetAt) {
-		return "active_window"
+	fiveHour := window.FiveHour
+	if fiveHour.WindowMinutes == 0 && !window.ResetAt.IsZero() && !window.LastProbeAt.IsZero() {
+		// Older state did not record window length. Accept only a reset that was
+		// within five hours of the observed request; a weekly reset is excluded.
+		if duration := window.ResetAt.Sub(window.LastProbeAt); duration >= 0 && duration <= 5*time.Hour+10*time.Minute {
+			fiveHour = quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: window.ResetAt, ObservedAt: window.LastProbeAt}
+		}
 	}
-	if window.ResetAt.IsZero() && now.Before(window.LastProbeAt.Add(5*time.Hour)) {
+	if fiveHour.WindowMinutes == fiveHourMinutes {
+		if now.Before(fiveHour.ResetAt) {
+			return "active_five_hour_window"
+		}
+		if sameFiveHourWindow(fiveHour.ResetAt, window.LastPrewarmResetAt) {
+			return "already_prewarmed_for_window"
+		}
+	} else if policy == "skip" {
+		return "five_hour_unknown"
+	} else if now.Before(window.LastProbeAt.Add(5 * time.Hour)) {
 		return "unverified_window_cooldown"
 	}
+	if remaining, known := weeklyRemaining(window.Weekly, now); known {
+		if !remaining {
+			return "weekly_exhausted"
+		}
+	} else if policy == "skip" {
+		return "weekly_unknown"
+	} else if now.Before(window.LastProbeAt.Add(5 * time.Hour)) {
+		return "unverified_weekly_cooldown"
+	}
 	return ""
+}
+
+func (r *runtime) accountWindow(account string) accountWindow {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.Accounts[account]
 }
 
 func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result accountResult) {
 	r.mu.Lock()
 	window := r.state.Accounts[account]
+	window.LastPrewarmAt = result.FinishedAt.UTC()
+	if window.FiveHour.WindowMinutes == fiveHourMinutes {
+		window.LastPrewarmResetAt = window.FiveHour.ResetAt
+	} else if !window.ResetAt.IsZero() && !window.LastProbeAt.IsZero() {
+		if duration := window.ResetAt.Sub(window.LastProbeAt); duration >= 0 && duration <= 5*time.Hour+10*time.Minute {
+			window.LastPrewarmResetAt = window.ResetAt
+		}
+	}
 	if result.ResponseReceived {
 		window.LastProbeAt = result.FinishedAt.UTC()
 		window.RetryAfter = time.Time{}
-		if !result.PrimaryResetAt.IsZero() {
+		if result.FiveHour.WindowMinutes == fiveHourMinutes {
+			window.FiveHour = result.FiveHour
+		}
+		if result.Weekly.WindowMinutes == weeklyMinutes {
+			window.Weekly = result.Weekly
+		}
+		if result.FiveHour.WindowMinutes == fiveHourMinutes {
+			window.ResetAt = result.FiveHour.ResetAt
+		} else if !result.PrimaryResetAt.IsZero() {
 			window.ResetAt = result.PrimaryResetAt
 		} else if !window.ResetAt.After(result.FinishedAt) {
 			window.ResetAt = time.Time{}
@@ -731,6 +794,10 @@ func (r *runtime) appendRun(cfg pluginConfig, record runRecord) {
 	if err := r.persistState(cfg.StatePath); err != nil {
 		r.setLastError("state_write_failed")
 		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
+	}
+	if err := appendAuditEntry(cfg.StatePath, auditEntry{At: record.FinishedAt, Event: "run_finished", RunID: record.ID, Trigger: record.Trigger, Job: record.Job, SourceAccount: record.SourceAccount, Run: &record}); err != nil {
+		r.setLastError("audit_write_failed")
+		logHost("error", "codex daily prewarm audit write failed", map[string]any{"error_code": "audit_write_failed"})
 	}
 }
 
@@ -884,28 +951,42 @@ func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	now := time.Now()
-	resetAt := primaryResetAt(record.ResponseHeaders, now)
+	fiveHour, weekly := parseQuotaWindows(record.ResponseHeaders, now)
 	account := accountFingerprint(record.AuthID)
 	r.mu.Lock()
 	cfg := r.cfg
-	if r.closed || !cfg.SyncOnFirstUse {
+	if r.closed {
 		r.mu.Unlock()
 		return
 	}
 	window := r.state.Accounts[account]
 	window.LastProbeAt = now.UTC()
-	if !resetAt.IsZero() {
-		window.ResetAt = resetAt
+	if fiveHour.WindowMinutes == fiveHourMinutes {
+		window.FiveHour = fiveHour
+		window.ResetAt = fiveHour.ResetAt // Retain the legacy field for rollback.
 	}
-	if (!resetAt.IsZero() && resetAt.Equal(window.LastSyncResetAt)) ||
-		(resetAt.IsZero() && now.Before(window.LastSyncAt.Add(5*time.Hour))) {
-		r.state.Accounts[account] = window
+	if weekly.WindowMinutes == weeklyMinutes {
+		window.Weekly = weekly
+	}
+	shouldPersist := now.Sub(r.lastQuotaPersistAt) >= time.Minute ||
+		(fiveHour.WindowMinutes == fiveHourMinutes && !sameFiveHourWindow(fiveHour.ResetAt, r.state.Accounts[account].FiveHour.ResetAt)) ||
+		(weekly.WindowMinutes == weeklyMinutes && (r.state.Accounts[account].Weekly.WindowMinutes == 0 || weekly.UsedPercent >= 100 && r.state.Accounts[account].Weekly.UsedPercent < 100))
+	if shouldPersist {
+		r.lastQuotaPersistAt = now
+	}
+	r.state.Accounts[account] = window
+	if !cfg.SyncOnFirstUse || !newlyOpenedFiveHour(fiveHour, now) || sameFiveHourWindow(fiveHour.ResetAt, window.LastSyncResetAt) {
 		r.mu.Unlock()
+		if shouldPersist {
+			if err := r.persistState(cfg.StatePath); err != nil {
+				r.setLastError("state_write_failed")
+			}
+		}
 		return
 	}
 	job := prewarmJob{Name: "first-use", Model: cfg.Model, Prompt: cfg.Prompt}
 	window.LastSyncAt = now.UTC()
-	window.LastSyncResetAt = resetAt
+	window.LastSyncResetAt = fiveHour.ResetAt
 	r.state.Accounts[account] = window
 	r.state.LastSyncAt = now.In(cfg.Location)
 	r.mu.Unlock()

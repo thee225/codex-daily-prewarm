@@ -10,7 +10,7 @@ func TestParsePluginConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AutomaticEnabled || cfg.Schedule != "0 5,10,15,20 * * *" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-6-luna" || cfg.FallbackModel != "gpt-5.6-luna" || cfg.Prompt != "hi" || cfg.ExpectedAccountCount != 0 {
+	if cfg.AutomaticEnabled || cfg.Schedule != "0 5,10,15,20 * * *" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-6-luna" || cfg.FallbackModel != "gpt-5.6-luna" || cfg.Prompt != "hi" || cfg.ExpectedAccountCount != 0 || cfg.UnknownQuotaPolicy != "skip" {
 		t.Fatalf("unexpected defaults: %#v", cfg.public())
 	}
 	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 0, 0, 0, cfg.Location)); got.Hour() != 10 || got.Minute() != 0 {
@@ -49,6 +49,7 @@ func TestParsePluginConfigRejectsUnsafeValues(t *testing.T) {
 		"model":           "model: 'gpt 5'",
 		"state":           "state_path: relative.json",
 		"count":           "expected_account_count: -1",
+		"unknown policy":  "unknown_quota_policy: always",
 		"mixed schedules": "schedule: '0 6 * * *'\njobs:\n  - name: noon\n    schedule: '0 12 * * *'",
 		"duplicate jobs":  "jobs:\n  - name: morning\n    schedule: '0 6 * * *'\n  - name: morning\n    schedule: '0 12 * * *'",
 		"invalid job":     "jobs:\n  - name: bad/job\n    schedule: '0 6 * * *'",

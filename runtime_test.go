@@ -40,23 +40,109 @@ func TestDynamicAccountCount(t *testing.T) {
 func TestPerAccountWindowDecision(t *testing.T) {
 	now := time.Date(2026, 9, 23, 11, 30, 0, 0, time.UTC)
 	r := newRuntime()
-	r.state.Accounts["active"] = accountWindow{ResetAt: now.Add(time.Hour)}
+	weekly := quotaWindow{WindowMinutes: weeklyMinutes, UsedPercent: 40, ResetAt: now.Add(48 * time.Hour)}
+	r.state.Accounts["active"] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(time.Hour)}, Weekly: weekly}
 	r.state.Accounts["quota"] = accountWindow{RetryAfter: now.Add(48 * time.Hour)}
-	r.state.Accounts["unknown"] = accountWindow{LastProbeAt: now.Add(-time.Hour)}
-	r.state.Accounts["expired"] = accountWindow{ResetAt: now.Add(-time.Minute)}
-	if got := r.skipReason("active", now); got != "active_window" {
+	r.state.Accounts["unknown"] = accountWindow{Weekly: weekly}
+	r.state.Accounts["weekly_exhausted"] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(-time.Minute)}, Weekly: quotaWindow{WindowMinutes: weeklyMinutes, UsedPercent: 100, ResetAt: now.Add(48 * time.Hour)}}
+	r.state.Accounts["expired"] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(-time.Minute)}, Weekly: weekly}
+	if got := r.skipReason("active", now); got != "active_five_hour_window" {
 		t.Fatalf("active skip = %q", got)
 	}
 	if got := r.skipReason("quota", now); got != "quota_retry_pending" {
 		t.Fatalf("quota skip = %q", got)
 	}
-	if got := r.skipReason("unknown", now); got != "unverified_window_cooldown" {
+	if got := r.skipReason("unknown", now); got != "five_hour_unknown" {
 		t.Fatalf("unknown skip = %q", got)
 	}
-	for _, account := range []string{"expired", "new"} {
-		if got := r.skipReason(account, now); got != "" {
-			t.Fatalf("%s unexpectedly skipped: %q", account, got)
-		}
+	if got := r.skipReason("weekly_exhausted", now); got != "weekly_exhausted" {
+		t.Fatalf("weekly skip = %q", got)
+	}
+	if got := r.skipReason("expired", now); got != "" {
+		t.Fatalf("expired unexpectedly skipped: %q", got)
+	}
+	if got := r.skipReason("new", now); got != "five_hour_unknown" {
+		t.Fatalf("new account skip = %q", got)
+	}
+}
+
+func TestQuotaWindowsIdentifiedByLength(t *testing.T) {
+	now := time.Date(2026, 9, 23, 11, 30, 0, 0, time.UTC)
+	headers := http.Header{
+		"X-Codex-Primary-Window-Minutes":        []string{"10080"},
+		"X-Codex-Primary-Used-Percent":          []string{"79.5"},
+		"X-Codex-Primary-Reset-After-Seconds":   []string{"86400"},
+		"X-Codex-Secondary-Window-Minutes":      []string{"300"},
+		"X-Codex-Secondary-Used-Percent":        []string{"1"},
+		"X-Codex-Secondary-Reset-After-Seconds": []string{"18000"},
+	}
+	five, week := parseQuotaWindows(headers, now)
+	if five.WindowMinutes != 300 || five.UsedPercent != 1 || !five.ResetAt.Equal(now.Add(5*time.Hour)) {
+		t.Fatalf("five-hour window = %#v", five)
+	}
+	if week.WindowMinutes != 10080 || week.UsedPercent != 79.5 || !week.ResetAt.Equal(now.Add(24*time.Hour)) {
+		t.Fatalf("weekly window = %#v", week)
+	}
+}
+
+func TestFiveHourWindowDedupIgnoresResetJitter(t *testing.T) {
+	now := time.Now()
+	if !sameFiveHourWindow(now.Add(5*time.Hour), now.Add(5*time.Hour+20*time.Second)) {
+		t.Fatal("small reset-time jitter should not start another run")
+	}
+	if sameFiveHourWindow(now.Add(5*time.Hour), now.Add(10*time.Hour)) {
+		t.Fatal("the next five-hour window must start another run")
+	}
+	if !newlyOpenedFiveHour(quotaWindow{WindowMinutes: 300, ResetAt: now.Add(5 * time.Hour)}, now) {
+		t.Fatal("a fresh five-hour window should trigger")
+	}
+	if newlyOpenedFiveHour(quotaWindow{WindowMinutes: 300, ResetAt: now.Add(3 * time.Hour)}, now) {
+		t.Fatal("an already active window should not trigger")
+	}
+}
+
+func TestUnknownQuotaPolicyRequiresExplicitProbe(t *testing.T) {
+	now := time.Now()
+	r := newRuntime()
+	r.state.Accounts["weekly_unknown"] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(-time.Minute)}}
+	if got := r.skipReason("weekly_unknown", now); got != "weekly_unknown" {
+		t.Fatalf("strict policy = %q", got)
+	}
+	r.cfg.UnknownQuotaPolicy = "probe_once"
+	if got := r.skipReason("weekly_unknown", now); got != "" {
+		t.Fatalf("explicit one-probe policy = %q", got)
+	}
+	r.state.Accounts["weekly_unknown"] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(-time.Minute)}, LastProbeAt: now.Add(-time.Minute)}
+	if got := r.skipReason("weekly_unknown", now); got != "unverified_weekly_cooldown" {
+		t.Fatalf("repeated unknown probe = %q", got)
+	}
+}
+
+func TestPrewarmAttemptDeduplicatesWhenResponseHasNoQuotaHeaders(t *testing.T) {
+	now := time.Now()
+	r := newRuntime()
+	account := "account"
+	reset := now.Add(-time.Minute)
+	r.state.Accounts[account] = accountWindow{
+		FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: reset},
+		Weekly:   quotaWindow{WindowMinutes: weeklyMinutes, UsedPercent: 20, ResetAt: now.Add(24 * time.Hour)},
+	}
+	if got := r.skipReason(account, now); got != "" {
+		t.Fatalf("initial decision = %q", got)
+	}
+	cfg := r.cfg
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	r.recordAccountResult(cfg, account, accountResult{FinishedAt: now, ErrorCode: "model_execution_uncertain"})
+	if got := r.skipReason(account, now.Add(time.Minute)); got != "already_prewarmed_for_window" {
+		t.Fatalf("repeat decision = %q", got)
+	}
+	r.state.Accounts[account] = accountWindow{
+		FiveHour:           quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: reset.Add(5 * time.Hour)},
+		Weekly:             quotaWindow{WindowMinutes: weeklyMinutes, UsedPercent: 20, ResetAt: now.Add(24 * time.Hour)},
+		LastPrewarmResetAt: reset,
+	}
+	if got := r.skipReason(account, now.Add(5*time.Hour)); got != "" {
+		t.Fatalf("next window decision = %q", got)
 	}
 }
 
@@ -174,11 +260,11 @@ func TestResetSpreadRequiresEveryAvailableAccount(t *testing.T) {
 	r := newRuntime()
 	now := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
 	auths := []pluginapi.HostAuthFileEntry{{ID: "a"}, {ID: "b"}}
-	r.state.Accounts[accountFingerprint("a")] = accountWindow{ResetAt: now.Add(5 * time.Hour)}
+	r.state.Accounts[accountFingerprint("a")] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(5 * time.Hour)}}
 	if count, spread := r.resetSpread(auths, now); count != 1 || spread != nil {
 		t.Fatalf("partial reset observation: count=%d spread=%v", count, spread)
 	}
-	r.state.Accounts[accountFingerprint("b")] = accountWindow{ResetAt: now.Add(5*time.Hour + 30*time.Second)}
+	r.state.Accounts[accountFingerprint("b")] = accountWindow{FiveHour: quotaWindow{WindowMinutes: fiveHourMinutes, ResetAt: now.Add(5*time.Hour + 30*time.Second)}}
 	if count, spread := r.resetSpread(auths, now); count != 2 || spread == nil || *spread != 30 {
 		t.Fatalf("complete reset observation: count=%d spread=%v", count, spread)
 	}
@@ -229,7 +315,14 @@ func TestFirstUseStartsOneRoundAndPersistsCooldown(t *testing.T) {
 	if err := r.configure([]byte("sync_on_first_use: true\nstate_path: " + path + "\n")); err != nil {
 		t.Fatal(err)
 	}
-	record := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true}
+	record := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true, ResponseHeaders: http.Header{
+		"X-Codex-Primary-Window-Minutes":        []string{"300"},
+		"X-Codex-Primary-Used-Percent":          []string{"1"},
+		"X-Codex-Primary-Reset-After-Seconds":   []string{"18000"},
+		"X-Codex-Secondary-Window-Minutes":      []string{"10080"},
+		"X-Codex-Secondary-Used-Percent":        []string{"20"},
+		"X-Codex-Secondary-Reset-After-Seconds": []string{"86400"},
+	}}
 	r.handleUsage(record)
 	r.handleUsage(record)
 	deadline := time.Now().Add(2 * time.Second)

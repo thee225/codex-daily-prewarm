@@ -29,6 +29,7 @@ type pluginConfig struct {
 	FallbackModel        string         `json:"fallback_model"`
 	Prompt               string         `json:"-"`
 	ExpectedAccountCount int            `json:"expected_account_count"`
+	UnknownQuotaPolicy   string         `json:"unknown_quota_policy"`
 	AccountSpacing       time.Duration  `json:"-"`
 	RetryCount           int            `json:"retry_count"`
 	StatePath            string         `json:"state_path"`
@@ -61,6 +62,7 @@ type yamlPluginConfig struct {
 	FallbackModel        string           `yaml:"fallback_model"`
 	Prompt               string           `yaml:"prompt"`
 	ExpectedAccountCount *int             `yaml:"expected_account_count"`
+	UnknownQuotaPolicy   string           `yaml:"unknown_quota_policy"`
 	AccountSpacing       string           `yaml:"account_spacing"`
 	RetryCount           *int             `yaml:"retry_count"`
 	StatePath            string           `yaml:"state_path"`
@@ -78,6 +80,7 @@ func defaultPluginConfig() pluginConfig {
 		FallbackModel:        defaultFallbackModel,
 		Prompt:               defaultPrompt,
 		ExpectedAccountCount: 0,
+		UnknownQuotaPolicy:   "skip",
 		AccountSpacing:       30 * time.Second,
 		RetryCount:           1,
 		StatePath:            defaultStatePath,
@@ -120,6 +123,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if input.ExpectedAccountCount != nil {
 		cfg.ExpectedAccountCount = *input.ExpectedAccountCount
 	}
+	if value := strings.TrimSpace(input.UnknownQuotaPolicy); value != "" {
+		cfg.UnknownQuotaPolicy = value
+	}
 	if value := strings.TrimSpace(input.AccountSpacing); value != "" {
 		duration, err := time.ParseDuration(value)
 		if err != nil {
@@ -136,6 +142,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 
 	if cfg.ExpectedAccountCount < 0 || cfg.ExpectedAccountCount > 100 {
 		return cfg, fmt.Errorf("expected_account_count must be between 0 and 100")
+	}
+	if cfg.UnknownQuotaPolicy != "skip" && cfg.UnknownQuotaPolicy != "probe_once" {
+		return cfg, fmt.Errorf("unknown_quota_policy must be skip or probe_once")
 	}
 	if cfg.AccountSpacing < 0 || cfg.AccountSpacing > time.Hour {
 		return cfg, fmt.Errorf("account_spacing must be between 0 and 1h")
@@ -244,6 +253,7 @@ type publicConfig struct {
 	FallbackModel        string      `json:"fallback_model"`
 	PromptSummary        string      `json:"prompt_summary"`
 	ExpectedAccountCount int         `json:"expected_account_count"`
+	UnknownQuotaPolicy   string      `json:"unknown_quota_policy"`
 	AccountSpacing       string      `json:"account_spacing"`
 	RetryCount           int         `json:"retry_count"`
 	StatePath            string      `json:"state_path"`
@@ -271,6 +281,7 @@ func (cfg pluginConfig) public() publicConfig {
 		FallbackModel:        cfg.FallbackModel,
 		PromptSummary:        fmt.Sprintf("configured (%d bytes)", len([]byte(cfg.Prompt))),
 		ExpectedAccountCount: cfg.ExpectedAccountCount,
+		UnknownQuotaPolicy:   cfg.UnknownQuotaPolicy,
 		AccountSpacing:       cfg.AccountSpacing.String(),
 		RetryCount:           cfg.RetryCount,
 		StatePath:            cfg.StatePath,

@@ -234,6 +234,7 @@ func pluginRegistration() registration {
 				{Name: "fallback_model", Type: pluginapi.ConfigFieldTypeString, Description: "仅在明确不支持主模型时回退，默认 gpt-5.6-luna。"},
 				{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "发送给模型的短提示词，默认 hi。"},
 				{Name: "expected_account_count", Type: pluginapi.ConfigFieldTypeInteger, Description: "可选的账号数量保护；默认 0 为动态发现。"},
+				{Name: "unknown_quota_policy", Type: pluginapi.ConfigFieldTypeString, Description: "缺少五小时或周额度证据时，skip 为保守跳过；probe_once 最多每五小时探测一次。"},
 				{Name: "account_spacing", Type: pluginapi.ConfigFieldTypeString, Description: "账号请求间隔，例如 30s。"},
 				{Name: "retry_count", Type: pluginapi.ConfigFieldTypeInteger, Description: "明确失败时的有限重试次数；不重试结果不确定的请求。"},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "不含凭据的运行状态文件。"},
