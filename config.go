@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	defaultSchedule  = "0 6 * * *"
-	defaultTimezone  = "Asia/Shanghai"
-	defaultModel     = "gpt-5.6-luna"
-	defaultPrompt    = "hi"
-	defaultStatePath = "/CLIProxyAPI/plugins/state/codex-daily-prewarm.json"
+	defaultSchedule      = "0 5,10,15,20 * * *"
+	defaultTimezone      = "Asia/Shanghai"
+	defaultModel         = "gpt-6-luna"
+	defaultFallbackModel = "gpt-5.6-luna"
+	defaultPrompt        = "hi"
+	defaultStatePath     = "/CLIProxyAPI/plugins/state/codex-daily-prewarm.json"
 )
 
 type pluginConfig struct {
@@ -25,6 +26,7 @@ type pluginConfig struct {
 	Schedule             string         `json:"schedule"`
 	Timezone             string         `json:"timezone"`
 	Model                string         `json:"model"`
+	FallbackModel        string         `json:"fallback_model"`
 	Prompt               string         `json:"-"`
 	ExpectedAccountCount int            `json:"expected_account_count"`
 	AccountSpacing       time.Duration  `json:"-"`
@@ -56,6 +58,7 @@ type yamlPluginConfig struct {
 	Schedule             string           `yaml:"schedule"`
 	Timezone             string           `yaml:"timezone"`
 	Model                string           `yaml:"model"`
+	FallbackModel        string           `yaml:"fallback_model"`
 	Prompt               string           `yaml:"prompt"`
 	ExpectedAccountCount *int             `yaml:"expected_account_count"`
 	AccountSpacing       string           `yaml:"account_spacing"`
@@ -72,8 +75,9 @@ func defaultPluginConfig() pluginConfig {
 		Schedule:             defaultSchedule,
 		Timezone:             defaultTimezone,
 		Model:                defaultModel,
+		FallbackModel:        defaultFallbackModel,
 		Prompt:               defaultPrompt,
-		ExpectedAccountCount: 3,
+		ExpectedAccountCount: 0,
 		AccountSpacing:       30 * time.Second,
 		RetryCount:           1,
 		StatePath:            defaultStatePath,
@@ -107,6 +111,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if value := strings.TrimSpace(input.Model); value != "" {
 		cfg.Model = value
 	}
+	if value := strings.TrimSpace(input.FallbackModel); value != "" {
+		cfg.FallbackModel = value
+	}
 	if input.Prompt != "" {
 		cfg.Prompt = input.Prompt
 	}
@@ -138,6 +145,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if err := validateModel(cfg.Model); err != nil {
 		return cfg, err
+	}
+	if err := validateModel(cfg.FallbackModel); err != nil {
+		return cfg, fmt.Errorf("fallback_model: %w", err)
 	}
 	if !utf8.ValidString(cfg.Prompt) || strings.TrimSpace(cfg.Prompt) == "" || len([]byte(cfg.Prompt)) > 1024 {
 		return cfg, fmt.Errorf("prompt must be valid UTF-8 between 1 and 1024 bytes")
@@ -231,6 +241,7 @@ type publicConfig struct {
 	Schedule             string      `json:"schedule"`
 	Timezone             string      `json:"timezone"`
 	Model                string      `json:"model"`
+	FallbackModel        string      `json:"fallback_model"`
 	PromptSummary        string      `json:"prompt_summary"`
 	ExpectedAccountCount int         `json:"expected_account_count"`
 	AccountSpacing       string      `json:"account_spacing"`
@@ -257,6 +268,7 @@ func (cfg pluginConfig) public() publicConfig {
 		Schedule:             cfg.Schedule,
 		Timezone:             cfg.Timezone,
 		Model:                cfg.Model,
+		FallbackModel:        cfg.FallbackModel,
 		PromptSummary:        fmt.Sprintf("configured (%d bytes)", len([]byte(cfg.Prompt))),
 		ExpectedAccountCount: cfg.ExpectedAccountCount,
 		AccountSpacing:       cfg.AccountSpacing.String(),

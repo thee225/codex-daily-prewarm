@@ -26,32 +26,55 @@ func TestEligibleCodexAuths(t *testing.T) {
 	}
 }
 
-func TestFirstUseContinuesWithFewerAvailableAccounts(t *testing.T) {
-	if abortForAccountCount(3, 2, "first_use") {
-		t.Fatal("first-use should still test other available accounts")
+func TestDynamicAccountCount(t *testing.T) {
+	for _, count := range []int{1, 2, 3, 5, 20} {
+		if abortForAccountCount(0, count, "schedule") {
+			t.Fatalf("dynamic account inventory %d was rejected", count)
+		}
 	}
 	if !abortForAccountCount(3, 2, "schedule") {
-		t.Fatal("scheduled run must retain the three-account guard")
-	}
-	if !abortForAccountCount(3, 4, "first_use") {
-		t.Fatal("unexpected extra accounts must not receive requests")
+		t.Fatal("an explicitly configured inventory guard must still work")
 	}
 }
 
-func TestFirstUseRetriesAfterNoAccountWasTested(t *testing.T) {
+func TestPerAccountWindowDecision(t *testing.T) {
 	now := time.Date(2026, 9, 23, 11, 30, 0, 0, time.UTC)
-	state := newState()
-	state.LastSyncAt = now.Add(-6 * time.Minute)
-	state.History = []runRecord{{Trigger: "first_use", Attempted: 0, ErrorCode: "unexpected_account_count"}}
-	if firstUseCoolingDown(state, now) {
-		t.Fatal("a run that tested no account should retry after five minutes")
+	r := newRuntime()
+	r.state.Accounts["active"] = accountWindow{ResetAt: now.Add(time.Hour)}
+	r.state.Accounts["quota"] = accountWindow{RetryAfter: now.Add(48 * time.Hour)}
+	r.state.Accounts["unknown"] = accountWindow{LastProbeAt: now.Add(-time.Hour)}
+	r.state.Accounts["expired"] = accountWindow{ResetAt: now.Add(-time.Minute)}
+	if got := r.skipReason("active", now); got != "active_window" {
+		t.Fatalf("active skip = %q", got)
 	}
-	if !firstUseCoolingDown(state, now.Add(-5*time.Minute)) {
-		t.Fatal("a failed run must not retry on every client request")
+	if got := r.skipReason("quota", now); got != "quota_retry_pending" {
+		t.Fatalf("quota skip = %q", got)
 	}
-	state.History[0].Attempted = 1
-	if !firstUseCoolingDown(state, now) {
-		t.Fatal("a run that tested an account must retain the five-hour cooldown")
+	if got := r.skipReason("unknown", now); got != "unverified_window_cooldown" {
+		t.Fatalf("unknown skip = %q", got)
+	}
+	for _, account := range []string{"expired", "new"} {
+		if got := r.skipReason(account, now); got != "" {
+			t.Fatalf("%s unexpectedly skipped: %q", account, got)
+		}
+	}
+}
+
+func TestFallbackOnlyOnExplicitUnsupportedModel(t *testing.T) {
+	if !explicitUnsupportedModel(http.StatusBadRequest, []byte(`{"error":{"code":"model_not_found"}}`)) {
+		t.Fatal("known model error should allow fallback")
+	}
+	for _, test := range []struct {
+		status int
+		body   string
+	}{
+		{http.StatusTooManyRequests, `{"error":{"code":"model_not_found"}}`},
+		{http.StatusBadRequest, `{"error":{"code":"invalid_request"}}`},
+		{http.StatusBadRequest, `bad response`},
+	} {
+		if explicitUnsupportedModel(test.status, []byte(test.body)) {
+			t.Fatalf("unsafe fallback: %d %s", test.status, test.body)
+		}
 	}
 }
 
@@ -111,6 +134,7 @@ func TestStateRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "state.json")
 	state := newState()
 	state.Daily["2026-09-21"] = map[string]bool{"acct-123": true}
+	state.Accounts["acct-123"] = accountWindow{ResetAt: time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)}
 	state.History = []runRecord{{ID: "1", Date: "2026-09-21", Success: true}}
 	if err := writeState(path, state); err != nil {
 		t.Fatal(err)
@@ -126,8 +150,37 @@ func TestStateRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Daily["2026-09-21"]["acct-123"] || len(loaded.History) != 1 {
+	if !loaded.Daily["2026-09-21"]["acct-123"] || len(loaded.History) != 1 || loaded.Accounts["acct-123"].ResetAt.IsZero() {
 		t.Fatalf("loaded = %#v", loaded)
+	}
+}
+
+func TestLegacyStateSeedsObservedWindows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := newState()
+	state.Accounts = nil
+	reset := time.Date(2026, 9, 23, 20, 0, 0, 0, time.UTC)
+	state.History = []runRecord{{Accounts: []accountResult{{Account: "acct-legacy", ResponseReceived: true, FinishedAt: reset.Add(-5 * time.Hour), PrimaryResetAt: reset}}}}
+	if err := writeState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readState(path)
+	if err != nil || !loaded.Accounts["acct-legacy"].ResetAt.Equal(reset) {
+		t.Fatalf("legacy migration: %#v, %v", loaded.Accounts, err)
+	}
+}
+
+func TestResetSpreadRequiresEveryAvailableAccount(t *testing.T) {
+	r := newRuntime()
+	now := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+	auths := []pluginapi.HostAuthFileEntry{{ID: "a"}, {ID: "b"}}
+	r.state.Accounts[accountFingerprint("a")] = accountWindow{ResetAt: now.Add(5 * time.Hour)}
+	if count, spread := r.resetSpread(auths, now); count != 1 || spread != nil {
+		t.Fatalf("partial reset observation: count=%d spread=%v", count, spread)
+	}
+	r.state.Accounts[accountFingerprint("b")] = accountWindow{ResetAt: now.Add(5*time.Hour + 30*time.Second)}
+	if count, spread := r.resetSpread(auths, now); count != 2 || spread == nil || *spread != 30 {
+		t.Fatalf("complete reset observation: count=%d spread=%v", count, spread)
 	}
 }
 

@@ -10,10 +10,10 @@ func TestParsePluginConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AutomaticEnabled || cfg.Schedule != "0 6 * * *" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-5.6-luna" || cfg.Prompt != "hi" {
+	if cfg.AutomaticEnabled || cfg.Schedule != "0 5,10,15,20 * * *" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-6-luna" || cfg.FallbackModel != "gpt-5.6-luna" || cfg.Prompt != "hi" || cfg.ExpectedAccountCount != 0 {
 		t.Fatalf("unexpected defaults: %#v", cfg.public())
 	}
-	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 0, 0, 0, cfg.Location)); got.Hour() != 6 || got.Minute() != 0 {
+	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 0, 0, 0, cfg.Location)); got.Hour() != 10 || got.Minute() != 0 {
 		t.Fatalf("next run = %v", got)
 	}
 }

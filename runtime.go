@@ -28,27 +28,40 @@ const (
 type runtimeState struct {
 	Version    int                        `json:"version"`
 	Daily      map[string]map[string]bool `json:"daily,omitempty"`
+	Accounts   map[string]accountWindow   `json:"accounts,omitempty"`
 	History    []runRecord                `json:"history,omitempty"`
 	LastSyncAt time.Time                  `json:"last_sync_at,omitempty"`
 }
 
+// The old daily map remains readable for rollback, but decisions use the
+// observed, per-account reset time. A missing reset is never called confirmed.
+type accountWindow struct {
+	ResetAt         time.Time `json:"reset_at,omitempty"`
+	LastProbeAt     time.Time `json:"last_probe_at,omitempty"`
+	RetryAfter      time.Time `json:"retry_after,omitempty"`
+	LastSyncAt      time.Time `json:"last_sync_at,omitempty"`
+	LastSyncResetAt time.Time `json:"last_sync_reset_at,omitempty"`
+}
+
 type runRecord struct {
-	ID         string          `json:"id"`
-	Job        string          `json:"job,omitempty"`
-	Trigger    string          `json:"trigger"`
-	Force      bool            `json:"force"`
-	Date       string          `json:"date"`
-	Model      string          `json:"model"`
-	StartedAt  time.Time       `json:"started_at"`
-	FinishedAt time.Time       `json:"finished_at,omitempty"`
-	Expected   int             `json:"expected_accounts"`
-	Discovered int             `json:"discovered_accounts"`
-	Attempted  int             `json:"attempted_accounts"`
-	Succeeded  int             `json:"succeeded_accounts"`
-	Skipped    int             `json:"skipped_accounts"`
-	Success    bool            `json:"success"`
-	ErrorCode  string          `json:"error_code,omitempty"`
-	Accounts   []accountResult `json:"accounts,omitempty"`
+	ID                 string          `json:"id"`
+	Job                string          `json:"job,omitempty"`
+	Trigger            string          `json:"trigger"`
+	Force              bool            `json:"force"`
+	Date               string          `json:"date"`
+	Model              string          `json:"model"`
+	StartedAt          time.Time       `json:"started_at"`
+	FinishedAt         time.Time       `json:"finished_at,omitempty"`
+	Expected           int             `json:"expected_accounts"`
+	Discovered         int             `json:"discovered_accounts"`
+	Attempted          int             `json:"attempted_accounts"`
+	Succeeded          int             `json:"succeeded_accounts"`
+	Skipped            int             `json:"skipped_accounts"`
+	ObservedResetCount int             `json:"observed_reset_accounts"`
+	ResetSpreadSeconds *int64          `json:"reset_spread_seconds,omitempty"`
+	Success            bool            `json:"success"`
+	ErrorCode          string          `json:"error_code,omitempty"`
+	Accounts           []accountResult `json:"accounts,omitempty"`
 }
 
 type accountResult struct {
@@ -60,6 +73,8 @@ type accountResult struct {
 	Attempts         int       `json:"attempts"`
 	StatusCode       int       `json:"status_code,omitempty"`
 	ResponseReceived bool      `json:"response_received"`
+	FallbackUsed     bool      `json:"fallback_used,omitempty"`
+	SkipReason       string    `json:"skip_reason,omitempty"`
 	PrimaryResetAt   time.Time `json:"primary_reset_at,omitempty"`
 	PrimaryUsed      string    `json:"primary_used_percent,omitempty"`
 	ErrorCode        string    `json:"error_code,omitempty"`
@@ -136,7 +151,7 @@ func newRuntime() *runtime {
 }
 
 func newState() runtimeState {
-	return runtimeState{Version: stateVersion, Daily: make(map[string]map[string]bool)}
+	return runtimeState{Version: stateVersion, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow)}
 }
 
 func (r *runtime) configure(raw []byte) error {
@@ -282,14 +297,10 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		return record
 	}
 	record.Discovered = len(auths)
-	inventoryMismatch := cfg.ExpectedAccountCount > 0 && len(auths) != cfg.ExpectedAccountCount
 	if abortForAccountCount(cfg.ExpectedAccountCount, len(auths), request.Trigger) {
 		record.ErrorCode = "unexpected_account_count"
 		logHost("error", "codex daily prewarm account count mismatch", map[string]any{"expected": cfg.ExpectedAccountCount, "discovered": len(auths)})
 		return record
-	}
-	if inventoryMismatch {
-		logHost("warn", "codex first-use sync has fewer available accounts than expected", map[string]any{"expected": cfg.ExpectedAccountCount, "discovered": len(auths)})
 	}
 	if len(auths) == 0 {
 		record.ErrorCode = "no_eligible_codex_accounts"
@@ -298,9 +309,16 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 
 	for index, auth := range auths {
 		fingerprint := accountFingerprint(auth.ID)
-		if auth.ID == request.SourceAuthID || (!request.Force && r.completedToday(record.Date, request.Job.Name, fingerprint)) {
+		if auth.ID == request.SourceAuthID {
 			record.Skipped++
 			continue
+		}
+		if !request.Force {
+			if reason := r.skipReason(fingerprint, time.Now()); reason != "" {
+				record.Skipped++
+				record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: reason})
+				continue
+			}
 		}
 		if record.Attempted > 0 && cfg.AccountSpacing > 0 {
 			time.Sleep(cfg.AccountSpacing)
@@ -308,28 +326,52 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		result := executeAccount(cfg, request.Job, auth)
 		record.Attempted++
 		record.Accounts = append(record.Accounts, result)
+		r.recordAccountResult(cfg, fingerprint, result)
 		if result.ResponseReceived {
 			record.Succeeded++
-			r.markCompleted(cfg, record.Date, request.Job.Name, fingerprint)
 		}
 		logHost("info", "codex daily prewarm account finished", map[string]any{
 			"account": fingerprint, "status": result.StatusCode, "response_received": result.ResponseReceived,
 			"error_code": result.ErrorCode, "position": index + 1, "total": len(auths),
 		})
 	}
-	if inventoryMismatch {
-		record.ErrorCode = "unexpected_account_count"
-	} else if record.Succeeded+record.Skipped != record.Discovered {
+	if record.Succeeded+record.Skipped != record.Discovered {
 		record.ErrorCode = "one_or_more_accounts_failed"
 	}
+	record.ObservedResetCount, record.ResetSpreadSeconds = r.resetSpread(auths, time.Now())
 	return record
 }
 
-func abortForAccountCount(expected, discovered int, trigger string) bool {
+func (r *runtime) resetSpread(auths []pluginapi.HostAuthFileEntry, now time.Time) (int, *int64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var earliest, latest time.Time
+	count := 0
+	for _, auth := range auths {
+		reset := r.state.Accounts[accountFingerprint(auth.ID)].ResetAt
+		if !reset.After(now) {
+			continue
+		}
+		count++
+		if earliest.IsZero() || reset.Before(earliest) {
+			earliest = reset
+		}
+		if latest.IsZero() || reset.After(latest) {
+			latest = reset
+		}
+	}
+	if count != len(auths) || count < 2 {
+		return count, nil
+	}
+	seconds := int64(latest.Sub(earliest).Seconds())
+	return count, &seconds
+}
+
+func abortForAccountCount(expected, discovered int, _ string) bool {
 	if expected <= 0 || discovered == expected {
 		return false
 	}
-	return trigger != "first_use" || discovered > expected
+	return true
 }
 
 func listCodexAuths() ([]pluginapi.HostAuthFileEntry, error) {
@@ -372,68 +414,101 @@ func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFil
 		Model:       job.Model,
 		StartedAt:   time.Now().In(cfg.Location),
 	}
-	body, err := json.Marshal(chatCompletionRequest{
-		Model:    job.Model,
-		Messages: []chatMessage{{Role: "user", Content: job.Prompt}},
-	})
-	if err != nil {
-		result.ErrorCode = "request_encoding_failed"
-		result.FinishedAt = time.Now().In(cfg.Location)
-		return result
+	models := []string{job.Model}
+	if cfg.FallbackModel != job.Model {
+		models = append(models, cfg.FallbackModel)
 	}
-
-	for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
-		result.Attempts++
-		raw, callErr := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
-			HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
-				EntryProtocol:  "openai",
-				ExitProtocol:   "openai",
-				Model:          job.Model,
-				Stream:         false,
-				Body:           body,
-				Headers:        http.Header{"Content-Type": []string{"application/json"}},
-				ForcedProvider: "codex",
-				AuthID:         auth.ID,
-			},
+	for modelIndex, model := range models {
+		result.Model = model
+		result.FallbackUsed = modelIndex > 0
+		body, err := json.Marshal(chatCompletionRequest{
+			Model: model, Messages: []chatMessage{{Role: "user", Content: job.Prompt}},
 		})
-		if callErr != nil {
-			var hostErr *hostCallbackError
-			if errors.As(callErr, &hostErr) && hostErr.HTTPStatus > 0 {
-				result.StatusCode = hostErr.HTTPStatus
-				result.PrimaryResetAt = upstreamResetAt(hostErr.Message, time.Now())
-				result.ErrorCode = upstreamErrorCode(hostErr.Message, hostErr.HTTPStatus)
-				if attempt >= cfg.RetryCount || !safeToRetryStatus(hostErr.HTTPStatus) {
-					break
+		if err != nil {
+			result.ErrorCode = "request_encoding_failed"
+			break
+		}
+		unsupported := false
+		for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
+			result.Attempts++
+			raw, callErr := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
+				HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+					EntryProtocol: "openai", ExitProtocol: "openai", Model: model,
+					Stream: false, Body: body, Headers: http.Header{"Content-Type": []string{"application/json"}},
+					ForcedProvider: "codex", AuthID: auth.ID,
+				},
+			})
+			if callErr != nil {
+				var hostErr *hostCallbackError
+				if errors.As(callErr, &hostErr) && hostErr.HTTPStatus > 0 {
+					result.StatusCode = hostErr.HTTPStatus
+					result.PrimaryResetAt = upstreamResetAt(hostErr.Message, time.Now())
+					result.ErrorCode = upstreamErrorCode(hostErr.Message, hostErr.HTTPStatus)
+					unsupported = explicitUnsupportedModel(hostErr.HTTPStatus, []byte(hostErr.Message))
+					if unsupported || attempt >= cfg.RetryCount || !safeToRetryStatus(hostErr.HTTPStatus) {
+						break
+					}
+					time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+					continue
 				}
-				time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
-				continue
+				// An uncertain callback may have consumed quota: never retry or fall back.
+				result.ErrorCode = "model_execution_uncertain"
+				break
 			}
-			// The host callback may have reached the provider before returning an
-			// error, so repeating it could consume twice. Treat it as uncertain.
-			result.ErrorCode = "model_execution_uncertain"
+			var response pluginapi.HostModelExecutionResponse
+			if err := json.Unmarshal(raw, &response); err != nil {
+				result.ErrorCode = "model_response_decode_failed"
+				break
+			}
+			result.StatusCode = response.StatusCode
+			result.PrimaryResetAt = primaryResetAt(response.Headers, time.Now())
+			if result.PrimaryResetAt.IsZero() && response.StatusCode == http.StatusTooManyRequests {
+				result.PrimaryResetAt = upstreamResetAt(string(response.Body), time.Now())
+			}
+			result.PrimaryUsed = boundedHeader(response.Headers, "x-codex-primary-used-percent")
+			if response.StatusCode >= 200 && response.StatusCode < 300 && validModelResponse(response.Body) {
+				result.ResponseReceived = true
+				result.ErrorCode = ""
+				break
+			}
+			result.ErrorCode = upstreamErrorCode(string(response.Body), response.StatusCode)
+			unsupported = explicitUnsupportedModel(response.StatusCode, response.Body)
+			if unsupported || attempt >= cfg.RetryCount || !safeToRetryStatus(response.StatusCode) {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
+		if result.ResponseReceived || !unsupported {
 			break
 		}
-		var response pluginapi.HostModelExecutionResponse
-		if err := json.Unmarshal(raw, &response); err != nil {
-			result.ErrorCode = "model_response_decode_failed"
-			break
-		}
-		result.StatusCode = response.StatusCode
-		result.PrimaryResetAt = primaryResetAt(response.Headers, time.Now())
-		result.PrimaryUsed = boundedHeader(response.Headers, "x-codex-primary-used-percent")
-		if response.StatusCode >= 200 && response.StatusCode < 300 && validModelResponse(response.Body) {
-			result.ResponseReceived = true
-			result.ErrorCode = ""
-			break
-		}
-		result.ErrorCode = statusErrorCode(response.StatusCode)
-		if attempt >= cfg.RetryCount || !safeToRetryStatus(response.StatusCode) {
-			break
-		}
-		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 	}
 	result.FinishedAt = time.Now().In(cfg.Location)
 	return result
+}
+
+func explicitUnsupportedModel(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	if len(body) == 0 || len(body) > 16<<10 || !json.Valid(body) {
+		return false
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	for _, code := range []string{payload.Error.Code, payload.Error.Type} {
+		switch strings.ToLower(strings.TrimSpace(code)) {
+		case "model_not_found", "unsupported_model", "model_not_supported":
+			return true
+		}
+	}
+	return false
 }
 
 func validModelResponse(raw []byte) bool {
@@ -587,6 +662,43 @@ func dailyKey(job, account string) string {
 	return job + "/" + account
 }
 
+func (r *runtime) skipReason(account string, now time.Time) string {
+	r.mu.RLock()
+	window := r.state.Accounts[account]
+	r.mu.RUnlock()
+	if now.Before(window.RetryAfter) {
+		return "quota_retry_pending"
+	}
+	if now.Before(window.ResetAt) {
+		return "active_window"
+	}
+	if window.ResetAt.IsZero() && now.Before(window.LastProbeAt.Add(5*time.Hour)) {
+		return "unverified_window_cooldown"
+	}
+	return ""
+}
+
+func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result accountResult) {
+	r.mu.Lock()
+	window := r.state.Accounts[account]
+	if result.ResponseReceived {
+		window.LastProbeAt = result.FinishedAt.UTC()
+		window.RetryAfter = time.Time{}
+		if !result.PrimaryResetAt.IsZero() {
+			window.ResetAt = result.PrimaryResetAt
+		} else if !window.ResetAt.After(result.FinishedAt) {
+			window.ResetAt = time.Time{}
+		}
+	} else if result.ErrorCode == "usage_limit_reached" && !result.PrimaryResetAt.IsZero() {
+		window.RetryAfter = result.PrimaryResetAt
+	}
+	r.state.Accounts[account] = window
+	r.mu.Unlock()
+	if err := r.persistState(cfg.StatePath); err != nil {
+		r.setLastError("state_write_failed")
+	}
+}
+
 func (r *runtime) completedToday(date, job, account string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -687,6 +799,29 @@ func readState(path string) (runtimeState, error) {
 	if state.Daily == nil {
 		state.Daily = make(map[string]map[string]bool)
 	}
+	if state.Accounts == nil {
+		state.Accounts = make(map[string]accountWindow)
+	}
+	// Seed the new per-account view from the previous plugin's bounded history.
+	// This avoids an unnecessary probe immediately after an upgrade.
+	if len(state.Accounts) == 0 {
+		for index := len(state.History) - 1; index >= 0; index-- {
+			for _, result := range state.History[index].Accounts {
+				if result.Account == "" || result.FinishedAt.IsZero() {
+					continue
+				}
+				window := state.Accounts[result.Account]
+				if result.ResponseReceived {
+					window.LastProbeAt = result.FinishedAt
+					window.ResetAt = result.PrimaryResetAt
+					window.RetryAfter = time.Time{}
+				} else if result.ErrorCode == "usage_limit_reached" {
+					window.RetryAfter = result.PrimaryResetAt
+				}
+				state.Accounts[result.Account] = window
+			}
+		}
+	}
 	if len(state.History) > maxHistoryItems {
 		state.History = state.History[:maxHistoryItems]
 	}
@@ -728,56 +863,59 @@ func writeState(path string, state runtimeState) error {
 }
 
 func cloneState(state runtimeState) runtimeState {
-	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
+	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
 	for date, accounts := range state.Daily {
 		clone.Daily[date] = make(map[string]bool, len(accounts))
 		for account, done := range accounts {
 			clone.Daily[date][account] = done
 		}
 	}
+	for account, window := range state.Accounts {
+		clone.Accounts[account] = window
+	}
 	return clone
 }
 
-// handleUsage starts one synchronization round after the first successful
-// authenticated client request in a five-hour window. Host model callbacks
-// have no frontend API key, so this plugin cannot trigger itself recursively.
+// handleUsage starts one synchronization round per observed source-account
+// window. Host model callbacks have no frontend API key, so they cannot
+// trigger this handler recursively.
 func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
 	if !eligibleFirstUse(record) {
 		return
 	}
+	now := time.Now()
+	resetAt := primaryResetAt(record.ResponseHeaders, now)
+	account := accountFingerprint(record.AuthID)
 	r.mu.Lock()
 	cfg := r.cfg
-	if r.closed || !cfg.SyncOnFirstUse || firstUseCoolingDown(r.state, time.Now()) {
+	if r.closed || !cfg.SyncOnFirstUse {
+		r.mu.Unlock()
+		return
+	}
+	window := r.state.Accounts[account]
+	window.LastProbeAt = now.UTC()
+	if !resetAt.IsZero() {
+		window.ResetAt = resetAt
+	}
+	if (!resetAt.IsZero() && resetAt.Equal(window.LastSyncResetAt)) ||
+		(resetAt.IsZero() && now.Before(window.LastSyncAt.Add(5*time.Hour))) {
+		r.state.Accounts[account] = window
 		r.mu.Unlock()
 		return
 	}
 	job := prewarmJob{Name: "first-use", Model: cfg.Model, Prompt: cfg.Prompt}
-	r.state.LastSyncAt = time.Now().In(cfg.Location)
+	window.LastSyncAt = now.UTC()
+	window.LastSyncResetAt = resetAt
+	r.state.Accounts[account] = window
+	r.state.LastSyncAt = now.In(cfg.Location)
 	r.mu.Unlock()
 	if err := r.persistState(cfg.StatePath); err != nil {
 		r.setLastError("state_write_failed")
 		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
 	}
-	if err := r.startRunJob(runRequest{Trigger: "first_use", Job: job, Force: true, SourceAuthID: record.AuthID}); err != nil {
+	if err := r.startRunJob(runRequest{Trigger: "first_use", Job: job, SourceAuthID: record.AuthID}); err != nil {
 		r.setLastError(safeErrorCode(err))
 	}
-}
-
-func firstUseCoolingDown(state runtimeState, now time.Time) bool {
-	if state.LastSyncAt.IsZero() {
-		return false
-	}
-	elapsed := now.Sub(state.LastSyncAt)
-	if elapsed >= 5*time.Hour {
-		return false
-	}
-	if len(state.History) > 0 {
-		latest := state.History[0]
-		if latest.Trigger == "first_use" && latest.Attempted == 0 && latest.ErrorCode == "unexpected_account_count" {
-			return elapsed < 5*time.Minute
-		}
-	}
-	return true
 }
 
 func eligibleFirstUse(record pluginapi.UsageRecord) bool {
