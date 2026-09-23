@@ -34,6 +34,9 @@ plugins:
 跳过刚才已经正式使用的账号，并向其他启用且可用的 Codex 账号发送短请求。
 插件自己的请求不会再次触发同步。它不会绕过 `429 usage_limit_reached`，
 已经开始的五小时窗口也不会因为新的短请求重新计时。
+若可用账号暂少于 `expected_account_count`，首次使用同步仍会测试其他可用账号，
+但该轮标记为账号数量不足；若因此一个账号都没测试到，五分钟后允许再次触发。
+固定时间预热继续严格校验账号数量。
 
 如果需要多个独立时间段，可以用 `jobs` 取代 `schedule`。每个任务独立按天去重，
 可以覆写模型和提示词。原来的单条 `schedule` 仍受支持，且旧状态文件无需迁移：
@@ -74,7 +77,7 @@ CPA `v7.3.9` 使用 Go `1.26`。Linux amd64 构建：
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.2.0
+make build GOOS=linux GOARCH=amd64 VERSION=0.2.1
 ```
 
 输出为 `dist/codex-daily-prewarm.so`。

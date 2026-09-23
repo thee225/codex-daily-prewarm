@@ -282,10 +282,14 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		return record
 	}
 	record.Discovered = len(auths)
-	if cfg.ExpectedAccountCount > 0 && len(auths) != cfg.ExpectedAccountCount {
+	inventoryMismatch := cfg.ExpectedAccountCount > 0 && len(auths) != cfg.ExpectedAccountCount
+	if abortForAccountCount(cfg.ExpectedAccountCount, len(auths), request.Trigger) {
 		record.ErrorCode = "unexpected_account_count"
 		logHost("error", "codex daily prewarm account count mismatch", map[string]any{"expected": cfg.ExpectedAccountCount, "discovered": len(auths)})
 		return record
+	}
+	if inventoryMismatch {
+		logHost("warn", "codex first-use sync has fewer available accounts than expected", map[string]any{"expected": cfg.ExpectedAccountCount, "discovered": len(auths)})
 	}
 	if len(auths) == 0 {
 		record.ErrorCode = "no_eligible_codex_accounts"
@@ -313,10 +317,19 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 			"error_code": result.ErrorCode, "position": index + 1, "total": len(auths),
 		})
 	}
-	if record.Succeeded+record.Skipped != record.Discovered {
+	if inventoryMismatch {
+		record.ErrorCode = "unexpected_account_count"
+	} else if record.Succeeded+record.Skipped != record.Discovered {
 		record.ErrorCode = "one_or_more_accounts_failed"
 	}
 	return record
+}
+
+func abortForAccountCount(expected, discovered int, trigger string) bool {
+	if expected <= 0 || discovered == expected {
+		return false
+	}
+	return trigger != "first_use" || discovered > expected
 }
 
 func listCodexAuths() ([]pluginapi.HostAuthFileEntry, error) {
@@ -734,7 +747,7 @@ func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
 	}
 	r.mu.Lock()
 	cfg := r.cfg
-	if r.closed || !cfg.SyncOnFirstUse || (!r.state.LastSyncAt.IsZero() && time.Since(r.state.LastSyncAt) < 5*time.Hour) {
+	if r.closed || !cfg.SyncOnFirstUse || firstUseCoolingDown(r.state, time.Now()) {
 		r.mu.Unlock()
 		return
 	}
@@ -748,6 +761,23 @@ func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
 	if err := r.startRunJob(runRequest{Trigger: "first_use", Job: job, Force: true, SourceAuthID: record.AuthID}); err != nil {
 		r.setLastError(safeErrorCode(err))
 	}
+}
+
+func firstUseCoolingDown(state runtimeState, now time.Time) bool {
+	if state.LastSyncAt.IsZero() {
+		return false
+	}
+	elapsed := now.Sub(state.LastSyncAt)
+	if elapsed >= 5*time.Hour {
+		return false
+	}
+	if len(state.History) > 0 {
+		latest := state.History[0]
+		if latest.Trigger == "first_use" && latest.Attempted == 0 && latest.ErrorCode == "unexpected_account_count" {
+			return elapsed < 5*time.Minute
+		}
+	}
+	return true
 }
 
 func eligibleFirstUse(record pluginapi.UsageRecord) bool {

@@ -26,6 +26,35 @@ func TestEligibleCodexAuths(t *testing.T) {
 	}
 }
 
+func TestFirstUseContinuesWithFewerAvailableAccounts(t *testing.T) {
+	if abortForAccountCount(3, 2, "first_use") {
+		t.Fatal("first-use should still test other available accounts")
+	}
+	if !abortForAccountCount(3, 2, "schedule") {
+		t.Fatal("scheduled run must retain the three-account guard")
+	}
+	if !abortForAccountCount(3, 4, "first_use") {
+		t.Fatal("unexpected extra accounts must not receive requests")
+	}
+}
+
+func TestFirstUseRetriesAfterNoAccountWasTested(t *testing.T) {
+	now := time.Date(2026, 9, 23, 11, 30, 0, 0, time.UTC)
+	state := newState()
+	state.LastSyncAt = now.Add(-6 * time.Minute)
+	state.History = []runRecord{{Trigger: "first_use", Attempted: 0, ErrorCode: "unexpected_account_count"}}
+	if firstUseCoolingDown(state, now) {
+		t.Fatal("a run that tested no account should retry after five minutes")
+	}
+	if !firstUseCoolingDown(state, now.Add(-5*time.Minute)) {
+		t.Fatal("a failed run must not retry on every client request")
+	}
+	state.History[0].Attempted = 1
+	if !firstUseCoolingDown(state, now) {
+		t.Fatal("a run that tested an account must retain the five-hour cooldown")
+	}
+}
+
 func TestValidModelResponse(t *testing.T) {
 	valid := [][]byte{
 		[]byte(`{"choices":[{"message":{"content":"hi"}}]}`),
