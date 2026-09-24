@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultSchedule      = "0 5,10,15,20 * * *"
+	defaultSchedule      = "0 5-23 * * *"
 	defaultTimezone      = "Asia/Shanghai"
 	defaultModel         = "gpt-6-luna"
 	defaultFallbackModel = "gpt-5.6-luna"
@@ -26,7 +26,7 @@ type pluginConfig struct {
 	DryRun               bool           `json:"dry_run"`
 	BarkURL              string         `json:"-"`
 	WarmAllowlist        []string       `json:"warm_allowlist,omitempty"`
-	SyncOnFirstUse       bool           `json:"sync_on_first_use"`
+	ResetFollowupMode    string         `json:"reset_followup_mode"`
 	Schedule             string         `json:"schedule"`
 	Timezone             string         `json:"timezone"`
 	Model                string         `json:"model"`
@@ -62,7 +62,8 @@ type yamlPluginConfig struct {
 	DryRun               *bool            `yaml:"dry_run"`
 	BarkURL              string           `yaml:"bark_url"`
 	WarmAllowlist        []string         `yaml:"warm_allowlist"`
-	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"`
+	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"` // Accepted for old CPA configs; intentionally ignored.
+	ResetFollowupMode    string           `yaml:"reset_followup_mode"`
 	Schedule             string           `yaml:"schedule"`
 	Timezone             string           `yaml:"timezone"`
 	Model                string           `yaml:"model"`
@@ -82,6 +83,7 @@ func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		AutomaticEnabled:     false,
 		DryRun:               true,
+		ResetFollowupMode:    "observe",
 		Schedule:             defaultSchedule,
 		Timezone:             defaultTimezone,
 		Model:                defaultModel,
@@ -138,8 +140,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		}
 		cfg.WarmAllowlist = append([]string(nil), input.WarmAllowlist...)
 	}
-	if input.SyncOnFirstUse != nil {
-		cfg.SyncOnFirstUse = *input.SyncOnFirstUse
+	if value := strings.TrimSpace(input.ResetFollowupMode); value != "" {
+		cfg.ResetFollowupMode = value
 	}
 	if value := strings.TrimSpace(input.Schedule); value != "" {
 		cfg.Schedule = value
@@ -181,6 +183,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if cfg.UnknownQuotaPolicy != "skip" {
 		return cfg, fmt.Errorf("unknown_quota_policy must be skip")
+	}
+	if cfg.ResetFollowupMode != "off" && cfg.ResetFollowupMode != "observe" && cfg.ResetFollowupMode != "active" {
+		return cfg, fmt.Errorf("reset_followup_mode must be off, observe or active")
 	}
 	if cfg.AccountSpacing < 0 || cfg.AccountSpacing > time.Hour {
 		return cfg, fmt.Errorf("account_spacing must be between 0 and 1h")
@@ -285,7 +290,7 @@ type publicConfig struct {
 	DryRun               bool        `json:"dry_run"`
 	BarkConfigured       bool        `json:"bark_configured"`
 	WarmAllowlist        []string    `json:"warm_allowlist,omitempty"`
-	SyncOnFirstUse       bool        `json:"sync_on_first_use"`
+	ResetFollowupMode    string      `json:"reset_followup_mode"`
 	Schedule             string      `json:"schedule"`
 	Timezone             string      `json:"timezone"`
 	Model                string      `json:"model"`
@@ -316,7 +321,7 @@ func (cfg pluginConfig) public() publicConfig {
 		DryRun:               cfg.DryRun,
 		BarkConfigured:       cfg.BarkURL != "",
 		WarmAllowlist:        append([]string(nil), cfg.WarmAllowlist...),
-		SyncOnFirstUse:       cfg.SyncOnFirstUse,
+		ResetFollowupMode:    cfg.ResetFollowupMode,
 		Schedule:             cfg.Schedule,
 		Timezone:             cfg.Timezone,
 		Model:                cfg.Model,

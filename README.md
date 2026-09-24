@@ -1,8 +1,8 @@
 # CPA Codex 额度巡检与预热插件
 
-下一版每小时巡检与重置补查的[设计方案和验收标准](docs/每小时巡检与重置补查方案.md)已确定，**待授权实施**；以下说明仍对应当前版本。
+每小时巡检与重置补查的[设计方案和验收标准](docs/每小时巡检与重置补查方案.md)已实现。生产补查先以 `observe` 模式记录真实情况；后续根据真实日志决定何时启用 `active`。
 
-插件逐账号读取 Codex 上游 `GET /backend-api/wham/usage`，按额度证据决定是否向指定账号发送一次短模型请求。它不参与 CPA 的正常轮询、权重或会话亲和。默认北京时间 05:00、10:00、15:00、20:00 巡检，时间可用 `schedule` 或 `jobs` 修改。
+插件逐账号读取 Codex 上游 `GET /backend-api/wham/usage`，按额度证据决定是否向指定账号发送一次短模型请求。它不参与 CPA 的正常轮询、权重或会话亲和。默认北京时间 05:00–23:00 每小时一个巡检槽位，整轮在整点后随机 10–60 秒启动；时间可用 `schedule` 或 `jobs` 修改。
 
 ## 决策规则
 
@@ -12,7 +12,7 @@
 4. 每个账号至少间隔五小时才允许再预热；每个滚动 24 小时最多五次**实际模型调用**。请求发出前先持久化次数；重试、备用模型、失败及结果不确定的调用都计数。状态写入失败时停止调用。
 5. `dry_run` 默认开启。它执行真实的只读额度查询并记录 `would_warm`，不发模型请求。启用真实预热前应查看运行记录。
 
-普通业务账号首次进入新五小时窗口时，后台合并发起全账号巡检。可信的 `429 usage_limit_reached` 只触发限频的**只读**巡检，不立即预热。两类事件均不改变当前会话的账号选择。
+普通业务请求和业务 `429` 不触发插件查询或预热。已使用五小时窗口与周剩余不大于 5% 的账号，若上游给出可信重置点，白天在重置后约 90 秒只读补查该账号；夜间交给次日定时巡检。`reset_followup_mode: observe` 仅记录补查时本应预热的账号，`active` 才允许补查发模型请求。
 
 ## 配置
 
@@ -26,8 +26,8 @@ plugins:
       automatic_enabled: true
       dry_run: true
       warm_allowlist: []
-      sync_on_first_use: true
-      schedule: "0 5,10,15,20 * * *"
+      reset_followup_mode: observe
+      schedule: "0 5-23 * * *"
       timezone: "Asia/Shanghai"
       model: "gpt-6-luna"
       fallback_model: "gpt-5.6-luna"
@@ -61,5 +61,5 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.5.5
+make build GOOS=linux GOARCH=amd64 VERSION=0.6.0
 ```

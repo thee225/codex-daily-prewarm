@@ -202,11 +202,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
 	case pluginabi.MethodUsageHandle:
-		var record pluginapi.UsageRecord
-		if err := json.Unmarshal(request, &record); err != nil {
-			return nil, fmt.Errorf("decode usage record: %w", err)
-		}
-		app.handleUsage(record)
+		// Older hosts may still call this route. Business usage never schedules work.
 		return okEnvelope(map[string]any{"accepted": true})
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
 		app.shutdown()
@@ -229,8 +225,8 @@ func pluginRegistration() registration {
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只读查询并记录 would_warm，不发模型请求；默认开启。"},
 				{Name: "warm_allowlist", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的灰度账号匿名指纹列表；空列表允许所有符合条件的账号。"},
 				{Name: "bark_url", Type: pluginapi.ConfigFieldTypeString, Description: "定时巡检汇总的 Bark HTTPS 地址；23:00 至 08:00 免打扰。仅存入受限 CPA 配置，不出现在插件状态与日志。"},
-				{Name: "sync_on_first_use", Type: pluginapi.ConfigFieldTypeBoolean, Description: "账号首次进入新五小时窗口后合并巡检；可信额度 429 仅触发只读巡检。"},
-				{Name: "schedule", Type: pluginapi.ConfigFieldTypeString, Description: "标准五段 cron；默认北京时间 05、10、15、20 点检查。"},
+				{Name: "reset_followup_mode", Type: pluginapi.ConfigFieldTypeString, Description: "重置补查模式：off、observe（只读观察，默认）或 active（符合条件后预热）。"},
+				{Name: "schedule", Type: pluginapi.ConfigFieldTypeString, Description: "标准五段 cron；默认北京时间 05 至 23 点每小时巡检，整轮随机延迟 10–60 秒。"},
 				{Name: "jobs", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的多时间段任务列表；每项含 name、schedule，可选 model 和 prompt。与 schedule 二选一。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "IANA 时区，例如 Asia/Shanghai。"},
 				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "预热模型，默认 gpt-6-luna。"},
@@ -243,7 +239,7 @@ func pluginRegistration() registration {
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "不含凭据的运行状态文件。"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: false},
 	}
 }
 

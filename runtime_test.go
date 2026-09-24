@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -290,57 +291,25 @@ func TestJobDailyKeysAreIndependentAndLegacyCompatible(t *testing.T) {
 	}
 }
 
-func TestFirstUseOnlyRespondsToSuccessfulExternalCodexUsage(t *testing.T) {
-	valid := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true}
-	if !eligibleFirstUse(valid) {
-		t.Fatal("successful external Codex request should trigger")
-	}
-	for name, mutate := range map[string]func(*pluginapi.UsageRecord){
-		"own callback":   func(r *pluginapi.UsageRecord) { r.APIKey = "" },
-		"failed":         func(r *pluginapi.UsageRecord) { r.Failed = true },
-		"other provider": func(r *pluginapi.UsageRecord) { r.Provider = "gemini" },
-		"no auth":        func(r *pluginapi.UsageRecord) { r.AuthID = "" },
-		"no generation":  func(r *pluginapi.UsageRecord) { r.Generate = false },
-	} {
-		t.Run(name, func(t *testing.T) {
-			record := valid
-			mutate(&record)
-			if eligibleFirstUse(record) {
-				t.Fatal("unexpected first-use trigger")
-			}
-		})
+func TestLegacyFirstUseConfigDoesNotRegisterUsagePlugin(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("sync_on_first_use: true\nreset_followup_mode: observe\n"))
+	if err != nil || cfg.ResetFollowupMode != "observe" || pluginRegistration().Capabilities.UsagePlugin {
+		t.Fatalf("business usage must not schedule work: config=%#v err=%v", cfg.public(), err)
 	}
 }
 
-func TestFirstUseStartsOneRoundAndPersistsCooldown(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	r := newRuntime()
-	if err := r.configure([]byte("sync_on_first_use: true\nstate_path: " + path + "\n")); err != nil {
-		t.Fatal(err)
-	}
-	record := pluginapi.UsageRecord{Provider: "codex", AuthID: "auth-1", APIKey: "client-key", Generate: true, ResponseHeaders: http.Header{
-		"X-Codex-Primary-Window-Minutes":        []string{"300"},
-		"X-Codex-Primary-Used-Percent":          []string{"1"},
-		"X-Codex-Primary-Reset-After-Seconds":   []string{"18000"},
-		"X-Codex-Secondary-Window-Minutes":      []string{"10080"},
-		"X-Codex-Secondary-Used-Percent":        []string{"20"},
-		"X-Codex-Secondary-Reset-After-Seconds": []string{"86400"},
-	}}
-	r.handleUsage(record)
-	r.handleUsage(record)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(r.history()) == 1 {
-			break
+func TestBusinessUsageAnd429DoNotChangePluginState(t *testing.T) {
+	for _, payload := range [][]byte{
+		[]byte(`{"provider":"codex","auth_id":"auth-1","generate":true}`),
+		[]byte(`{"provider":"codex","auth_id":"auth-1","failed":true,"status_code":429}`),
+	} {
+		before := app.status()
+		if _, err := handleMethod(pluginabi.MethodUsageHandle, payload); err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	history := r.history()
-	if len(history) != 1 || history[0].Trigger != "first_use" || history[0].Job != "first-use" {
-		t.Fatalf("unexpected history = %#v", history)
-	}
-	state, err := readState(path)
-	if err != nil || state.LastSyncAt.IsZero() {
-		t.Fatalf("sync state was not persisted: %#v, %v", state, err)
+		after := app.status()
+		if after.HistorySize != before.HistorySize || after.Running != before.Running || !after.LastSyncAt.Equal(before.LastSyncAt) || len(after.Accounts) != len(before.Accounts) {
+			t.Fatal("business usage changed prewarm state")
+		}
 	}
 }

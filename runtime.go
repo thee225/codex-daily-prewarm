@@ -29,6 +29,7 @@ type runtimeState struct {
 	Version    int                        `json:"version"`
 	Daily      map[string]map[string]bool `json:"daily,omitempty"`
 	Accounts   map[string]accountWindow   `json:"accounts,omitempty"`
+	Slots      map[string]scheduledSlot   `json:"slots,omitempty"`
 	History    []runRecord                `json:"history,omitempty"`
 	LastSyncAt time.Time                  `json:"last_sync_at,omitempty"`
 }
@@ -48,12 +49,25 @@ type accountWindow struct {
 	LastPrewarmResetAt time.Time   `json:"last_prewarm_reset_at,omitempty"`
 	FiveHour           quotaWindow `json:"five_hour,omitempty"`
 	Weekly             quotaWindow `json:"weekly,omitempty"`
+	FiveHourFollowupAt time.Time   `json:"five_hour_followup_at,omitempty"`
+	FiveHourFollowupR  time.Time   `json:"five_hour_followup_reset_at,omitempty"`
+	LastFiveHourR      time.Time   `json:"last_five_hour_followup_reset_at,omitempty"`
+	WeeklyFollowupAt   time.Time   `json:"weekly_followup_at,omitempty"`
+	WeeklyFollowupR    time.Time   `json:"weekly_followup_reset_at,omitempty"`
+	LastWeeklyR        time.Time   `json:"last_weekly_followup_reset_at,omitempty"`
+	QuotaRetryAt       time.Time   `json:"quota_retry_at,omitempty"`
+	QuotaRetryStep     int         `json:"quota_retry_step,omitempty"`
 }
 
 type runRecord struct {
 	ID                 string          `json:"id"`
 	Job                string          `json:"job,omitempty"`
 	Trigger            string          `json:"trigger"`
+	Slot               string          `json:"slot,omitempty"`
+	PlannedAt          time.Time       `json:"planned_at,omitempty"`
+	JitterSeconds      int             `json:"jitter_seconds,omitempty"`
+	TargetAccount      string          `json:"target_account,omitempty"`
+	FollowupKind       string          `json:"followup_kind,omitempty"`
 	SourceAccount      string          `json:"source_account,omitempty"`
 	Force              bool            `json:"force"`
 	Date               string          `json:"date"`
@@ -119,26 +133,33 @@ type jobNextRun struct {
 }
 
 type runRequest struct {
-	Trigger      string
-	Job          prewarmJob
-	Force        bool
-	SourceAuthID string
-	ReadOnly     bool
-	Notify       bool
+	Trigger       string
+	Job           prewarmJob
+	Force         bool
+	TargetAccount string
+	FollowupKind  string
+	DueAt         time.Time
+	Slot          string
+	SlotBase      time.Time
+	PlannedAt     time.Time
+	JitterSeconds int
+	ReadOnly      bool
+	ObserveOnly   bool
+	Notify        bool
 }
 
 type runtime struct {
-	mu                 sync.RWMutex
-	persistMu          sync.Mutex
-	cfg                pluginConfig
-	cron               *cron.Cron
-	state              runtimeState
-	running            bool
-	pending            []runRequest
-	closed             bool
-	lastError          string
-	lastQuotaPersistAt time.Time
-	lastEventAt        time.Time
+	mu             sync.RWMutex
+	persistMu      sync.Mutex
+	cfg            pluginConfig
+	cron           *cron.Cron
+	scheduler      *runtimeScheduler
+	currentRequest runRequest
+	state          runtimeState
+	running        bool
+	pending        []runRequest
+	closed         bool
+	lastError      string
 }
 
 type authListResponse struct {
@@ -173,7 +194,7 @@ func newRuntime() *runtime {
 }
 
 func newState() runtimeState {
-	return runtimeState{Version: stateVersion, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow)}
+	return runtimeState{Version: stateVersion, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), Slots: make(map[string]scheduledSlot)}
 }
 
 func (r *runtime) configure(raw []byte) error {
@@ -188,30 +209,40 @@ func (r *runtime) configure(raw []byte) error {
 
 	r.mu.Lock()
 	previous := r.cron
+	previousScheduler := r.scheduler
 	r.cron = nil
+	r.scheduler = nil
+	r.closed = true
+	r.mu.Unlock()
+	if previous != nil {
+		previous.Stop()
+	}
+	if previousScheduler != nil {
+		previousScheduler.stop()
+	}
+	r.mu.Lock()
 	r.cfg = cfg
 	r.state = state
 	r.closed = false
 	r.lastError = ""
+	r.mu.Unlock()
 	if cfg.AutomaticEnabled {
+		scheduler := newRuntimeScheduler(r)
 		c := cron.New(cron.WithLocation(cfg.Location))
 		for _, job := range cfg.Jobs {
 			job := job
 			if _, err := c.AddFunc(job.Schedule, func() {
-				if err := r.startRunJob(runRequest{Trigger: "schedule", Job: job}); err != nil {
-					r.setLastError(safeErrorCode(err))
-				}
+				scheduler.planSlot(job, latestCronSlot(job.CronSchedule, time.Now().In(cfg.Location)), time.Now())
 			}); err != nil {
-				r.mu.Unlock()
 				return fmt.Errorf("register job %s: %w", job.Name, err)
 			}
 		}
+		r.mu.Lock()
 		r.cron = c
+		r.scheduler = scheduler
+		r.mu.Unlock()
+		scheduler.bootstrap(cfg, time.Now())
 		c.Start()
-	}
-	r.mu.Unlock()
-	if previous != nil {
-		previous.Stop()
 	}
 	return nil
 }
@@ -220,10 +251,15 @@ func (r *runtime) shutdown() {
 	r.mu.Lock()
 	r.closed = true
 	c := r.cron
+	scheduler := r.scheduler
 	r.cron = nil
+	r.scheduler = nil
 	r.mu.Unlock()
 	if c != nil {
 		c.Stop()
+	}
+	if scheduler != nil {
+		scheduler.stop()
 	}
 }
 
@@ -260,9 +296,13 @@ func (r *runtime) startRunJob(request runRequest) error {
 		return errors.New("plugin is shutting down")
 	}
 	if r.running {
-		if request.Trigger == "schedule" || request.Trigger == "first_use" || request.Trigger == "quota_429" {
+		if request.Trigger != "manual" {
+			if r.currentRequest.Trigger == request.Trigger && r.currentRequest.Job.Name == request.Job.Name && r.currentRequest.TargetAccount == request.TargetAccount && r.currentRequest.Slot == request.Slot {
+				r.mu.Unlock()
+				return nil
+			}
 			for _, queued := range r.pending {
-				if queued.Trigger == request.Trigger && queued.Job.Name == request.Job.Name {
+				if queued.Trigger == request.Trigger && queued.Job.Name == request.Job.Name && queued.TargetAccount == request.TargetAccount && queued.Slot == request.Slot {
 					r.mu.Unlock()
 					return nil
 				}
@@ -275,6 +315,7 @@ func (r *runtime) startRunJob(request runRequest) error {
 		return errAlreadyRunning
 	}
 	r.running = true
+	r.currentRequest = request
 	r.lastError = ""
 	r.mu.Unlock()
 
@@ -295,11 +336,13 @@ func (r *runtime) runQueue(request runRequest) {
 		if len(r.pending) == 0 || r.closed {
 			r.pending = nil
 			r.running = false
+			r.currentRequest = runRequest{}
 			r.mu.Unlock()
 			return
 		}
 		request = r.pending[0]
 		r.pending = r.pending[1:]
+		r.currentRequest = request
 		r.mu.Unlock()
 	}
 }
@@ -307,17 +350,19 @@ func (r *runtime) runQueue(request runRequest) {
 func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	now := time.Now().In(cfg.Location)
 	record := runRecord{
-		ID:        fmt.Sprintf("%d", now.UnixNano()),
-		Job:       request.Job.Name,
-		Trigger:   request.Trigger,
-		Force:     request.Force,
-		Date:      now.Format("2006-01-02"),
-		Model:     request.Job.Model,
-		StartedAt: now,
-		Expected:  cfg.ExpectedAccountCount,
-	}
-	if request.SourceAuthID != "" {
-		record.SourceAccount = accountFingerprint(request.SourceAuthID)
+		ID:            fmt.Sprintf("%d", now.UnixNano()),
+		Job:           request.Job.Name,
+		Trigger:       request.Trigger,
+		Slot:          request.Slot,
+		PlannedAt:     request.PlannedAt,
+		JitterSeconds: request.JitterSeconds,
+		TargetAccount: request.TargetAccount,
+		FollowupKind:  request.FollowupKind,
+		Force:         request.Force,
+		Date:          now.Format("2006-01-02"),
+		Model:         request.Job.Model,
+		StartedAt:     now,
+		Expected:      cfg.ExpectedAccountCount,
 	}
 	if err := appendAuditEntry(cfg.StatePath, auditEntry{At: now, Event: "run_started", RunID: record.ID, Trigger: record.Trigger, Job: record.Job, SourceAccount: record.SourceAccount}); err != nil {
 		r.setLastError("audit_write_failed")
@@ -337,7 +382,6 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		logHost("error", "codex daily prewarm could not list auths", map[string]any{"error_code": record.ErrorCode})
 		return record
 	}
-	record.Discovered = len(auths)
 	if abortForAccountCount(cfg.ExpectedAccountCount, len(auths), request.Trigger) {
 		record.ErrorCode = "unexpected_account_count"
 		logHost("error", "codex daily prewarm account count mismatch", map[string]any{"expected": cfg.ExpectedAccountCount, "discovered": len(auths)})
@@ -347,21 +391,42 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		record.ErrorCode = "no_eligible_codex_accounts"
 		return record
 	}
+	if request.TargetAccount != "" {
+		selected := auths[:0]
+		for _, auth := range auths {
+			if accountFingerprint(auth.ID) == request.TargetAccount {
+				selected = append(selected, auth)
+			}
+		}
+		auths = selected
+		if len(auths) == 0 {
+			record.ErrorCode = "target_account_unavailable"
+			return record
+		}
+	}
+	record.Discovered = len(auths)
+	firstResults := fetchInitialUsages(auths, fetchUsage)
 
 	for index, auth := range auths {
 		fingerprint := accountFingerprint(auth.ID)
 		result := accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, StartedAt: time.Now().In(cfg.Location)}
-		first, reason := fetchUsage(auth)
+		first, reason := firstResults[index].observation, firstResults[index].reason
 		record.QuotaQueried++
 		if reason != "" {
 			result.QuotaStatus = "query_failed"
 			r.saveQuotaFailure(cfg, fingerprint, reason)
+			if request.TargetAccount != "" {
+				r.scheduleQuotaRetry(cfg, fingerprint, time.Now(), reason)
+			}
 		}
 		if reason == "" {
 			result.QuotaCheckedAt, result.FiveHour, result.Weekly = first.CheckedAt, first.FiveHour, first.Weekly
 			result.QuotaStatus = "confirmed"
 			if !r.saveQuota(cfg, fingerprint, first) {
 				reason = "state_write_failed"
+			}
+			if reason == "" && request.TargetAccount == "" {
+				r.clearQuotaRetry(cfg, fingerprint)
 			}
 			if reason == "" {
 				if first.Weekly.UsedPercent >= 95 {
@@ -370,42 +435,51 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 					reason = "upstream_disallowed"
 				} else if first.FiveHour.UsedPercent != 0 {
 					reason = "active_five_hour_window"
-				} else if request.ReadOnly {
-					reason = "readonly_event"
 				} else {
-					time.Sleep(3 * time.Second)
-					second, secondReason := fetchUsage(auth)
-					if secondReason != "" {
-						reason = "idle_confirmation_" + secondReason
-						result.QuotaStatus = "query_failed"
-						r.saveQuotaFailure(cfg, fingerprint, reason)
-					} else {
-						result.QuotaCheckedAt, result.FiveHour, result.Weekly = second.CheckedAt, second.FiveHour, second.Weekly
-						if !r.saveQuota(cfg, fingerprint, second) {
-							reason = "state_write_failed"
-						} else if !confirmedIdle(first, second) {
-							reason = "five_hour_not_confirmed_idle"
+					if limitReason := r.warmLimitReason(fingerprint, time.Now()); limitReason != "" {
+						reason = limitReason
+					}
+					if reason == "" && len(cfg.WarmAllowlist) > 0 {
+						selected := false
+						for _, allowed := range cfg.WarmAllowlist {
+							if allowed == fingerprint {
+								selected = true
+								break
+							}
+						}
+						if !selected {
+							reason = "gray_not_selected"
+						}
+					}
+					if reason == "" {
+						time.Sleep(3 * time.Second)
+						second, secondReason := fetchUsage(auth)
+						if secondReason != "" {
+							reason = "idle_confirmation_" + secondReason
+							result.QuotaStatus = "query_failed"
+							r.saveQuotaFailure(cfg, fingerprint, reason)
+							if request.TargetAccount != "" {
+								r.scheduleQuotaRetry(cfg, fingerprint, time.Now(), secondReason)
+							}
+						} else {
+							result.QuotaCheckedAt, result.FiveHour, result.Weekly = second.CheckedAt, second.FiveHour, second.Weekly
+							if !r.saveQuota(cfg, fingerprint, second) {
+								reason = "state_write_failed"
+							} else if !confirmedIdle(first, second) {
+								reason = "five_hour_not_confirmed_idle"
+							}
 						}
 					}
 				}
 			}
 		}
-		if reason == "" {
-			if limitReason := r.warmLimitReason(fingerprint, time.Now()); limitReason != "" {
-				reason = limitReason
-			}
+		if request.TargetAccount != "" && result.QuotaStatus != "query_failed" {
+			r.clearQuotaRetry(cfg, fingerprint)
 		}
-		if reason == "" && len(cfg.WarmAllowlist) > 0 {
-			selected := false
-			for _, allowed := range cfg.WarmAllowlist {
-				if allowed == fingerprint {
-					selected = true
-					break
-				}
-			}
-			if !selected {
-				reason = "gray_not_selected"
-			}
+		if reason == "" && request.ObserveOnly {
+			result.WouldWarm = true
+			record.WouldWarm++
+			reason = "followup_observe"
 		}
 		if reason == "" && cfg.DryRun {
 			result.WouldWarm = true
@@ -419,6 +493,13 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 			result.Attempts24h = r.attemptCount(fingerprint, time.Now())
 			record.Skipped++
 			record.Accounts = append(record.Accounts, result)
+			window := r.accountWindow(fingerprint)
+			logHost("info", "codex prewarm account skipped", map[string]any{
+				"account": fingerprint, "trigger": request.Trigger, "reason": reason,
+				"five_hour_used_percent": result.FiveHour.UsedPercent, "weekly_used_percent": result.Weekly.UsedPercent,
+				"next_five_hour_check_at": window.FiveHourFollowupAt, "next_weekly_check_at": window.WeeklyFollowupAt,
+				"quota_retry_at": window.QuotaRetryAt,
+			})
 			continue
 		}
 		if record.Attempted > 0 && cfg.AccountSpacing > 0 {
@@ -881,6 +962,9 @@ func (r *runtime) saveQuota(cfg pluginConfig, account string, observation quotaO
 	window.QuotaStatus = observation.Status
 	window.FiveHour = observation.FiveHour
 	window.Weekly = observation.Weekly
+	if cfg.ResetFollowupMode != "off" {
+		updateFollowupPlan(&window, observation)
+	}
 	r.state.Accounts[account] = window
 	r.mu.Unlock()
 	if err := r.persistState(cfg.StatePath); err != nil {
@@ -928,6 +1012,9 @@ func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result a
 			window.ResetAt = result.PrimaryResetAt
 		} else if !window.ResetAt.After(result.FinishedAt) {
 			window.ResetAt = time.Time{}
+		}
+		if cfg.ResetFollowupMode != "off" && result.FiveHour.WindowMinutes == fiveHourMinutes && result.Weekly.WindowMinutes == weeklyMinutes {
+			updateFollowupPlan(&window, quotaObservation{CheckedAt: result.FinishedAt, FiveHour: result.FiveHour, Weekly: result.Weekly})
 		}
 	} else if result.ErrorCode == "usage_limit_reached" && !result.PrimaryResetAt.IsZero() {
 		window.RetryAfter = result.PrimaryResetAt
@@ -1008,6 +1095,11 @@ func (r *runtime) status() runtimeStatus {
 	if r.cfg.AutomaticEnabled && r.cfg.Location != nil {
 		for _, job := range r.cfg.Jobs {
 			next := job.CronSchedule.Next(time.Now().In(r.cfg.Location))
+			for _, slot := range r.state.Slots {
+				if slot.Job == job.Name && slot.StartedAt.IsZero() && slot.PlannedAt.After(time.Now()) && (next.IsZero() || slot.PlannedAt.Before(next.Add(time.Minute))) {
+					next = slot.PlannedAt
+				}
+			}
 			status.NextRuns = append(status.NextRuns, jobNextRun{Name: job.Name, Schedule: job.Schedule, Model: job.Model, NextRunAt: next})
 			if status.NextRunAt.IsZero() || next.Before(status.NextRunAt) {
 				status.NextRunAt = next
@@ -1050,6 +1142,9 @@ func readState(path string) (runtimeState, error) {
 	}
 	if state.Accounts == nil {
 		state.Accounts = make(map[string]accountWindow)
+	}
+	if state.Slots == nil {
+		state.Slots = make(map[string]scheduledSlot)
 	}
 	// Import recent v0.4 model attempts once so the new rolling limit also
 	// covers calls made shortly before the upgrade.
@@ -1133,7 +1228,7 @@ func writeState(path string, state runtimeState) error {
 }
 
 func cloneState(state runtimeState) runtimeState {
-	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
+	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), Slots: make(map[string]scheduledSlot), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
 	for date, accounts := range state.Daily {
 		clone.Daily[date] = make(map[string]bool, len(accounts))
 		for account, done := range accounts {
@@ -1144,81 +1239,10 @@ func cloneState(state runtimeState) runtimeState {
 		window.AttemptTimes = append([]time.Time(nil), window.AttemptTimes...)
 		clone.Accounts[account] = window
 	}
+	for key, slot := range state.Slots {
+		clone.Slots[key] = slot
+	}
 	return clone
-}
-
-// handleUsage starts one synchronization round per observed source-account
-// window. Host model callbacks have no frontend API key, so they cannot
-// trigger this handler recursively.
-func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
-	if strings.TrimSpace(record.APIKey) != "" && strings.EqualFold(record.Provider, "codex") && record.Failed && record.Failure.StatusCode == http.StatusTooManyRequests && upstreamErrorCode(record.Failure.Body, record.Failure.StatusCode) == "usage_limit_reached" {
-		r.mu.Lock()
-		cfg := r.cfg
-		now := time.Now()
-		if r.closed || !cfg.SyncOnFirstUse || now.Sub(r.lastEventAt) < 5*time.Minute {
-			r.mu.Unlock()
-			return
-		}
-		r.lastEventAt = now
-		r.mu.Unlock()
-		job := prewarmJob{Name: "quota-429", Model: cfg.Model, Prompt: cfg.Prompt}
-		_ = r.startRunJob(runRequest{Trigger: "quota_429", Job: job, ReadOnly: true})
-		return
-	}
-	if !eligibleFirstUse(record) {
-		return
-	}
-	now := time.Now()
-	fiveHour, weekly := parseQuotaWindows(record.ResponseHeaders, now)
-	account := accountFingerprint(record.AuthID)
-	r.mu.Lock()
-	cfg := r.cfg
-	if r.closed {
-		r.mu.Unlock()
-		return
-	}
-	window := r.state.Accounts[account]
-	window.LastProbeAt = now.UTC()
-	if fiveHour.WindowMinutes == fiveHourMinutes {
-		window.FiveHour = fiveHour
-		window.ResetAt = fiveHour.ResetAt // Retain the legacy field for rollback.
-	}
-	if weekly.WindowMinutes == weeklyMinutes {
-		window.Weekly = weekly
-	}
-	shouldPersist := now.Sub(r.lastQuotaPersistAt) >= time.Minute ||
-		(fiveHour.WindowMinutes == fiveHourMinutes && !sameFiveHourWindow(fiveHour.ResetAt, r.state.Accounts[account].FiveHour.ResetAt)) ||
-		(weekly.WindowMinutes == weeklyMinutes && (r.state.Accounts[account].Weekly.WindowMinutes == 0 || weekly.UsedPercent >= 100 && r.state.Accounts[account].Weekly.UsedPercent < 100))
-	if shouldPersist {
-		r.lastQuotaPersistAt = now
-	}
-	r.state.Accounts[account] = window
-	if !cfg.SyncOnFirstUse || !newlyOpenedFiveHour(fiveHour, now) || sameFiveHourWindow(fiveHour.ResetAt, window.LastSyncResetAt) {
-		r.mu.Unlock()
-		if shouldPersist {
-			if err := r.persistState(cfg.StatePath); err != nil {
-				r.setLastError("state_write_failed")
-			}
-		}
-		return
-	}
-	job := prewarmJob{Name: "first-use", Model: cfg.Model, Prompt: cfg.Prompt}
-	window.LastSyncAt = now.UTC()
-	window.LastSyncResetAt = fiveHour.ResetAt
-	r.state.Accounts[account] = window
-	r.state.LastSyncAt = now.In(cfg.Location)
-	r.mu.Unlock()
-	if err := r.persistState(cfg.StatePath); err != nil {
-		r.setLastError("state_write_failed")
-		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
-	}
-	if err := r.startRunJob(runRequest{Trigger: "first_use", Job: job, SourceAuthID: record.AuthID}); err != nil {
-		r.setLastError(safeErrorCode(err))
-	}
-}
-
-func eligibleFirstUse(record pluginapi.UsageRecord) bool {
-	return strings.TrimSpace(record.APIKey) != "" && strings.EqualFold(record.Provider, "codex") && !record.Failed && record.Generate && strings.TrimSpace(record.AuthID) != ""
 }
 
 func pruneDaily(daily map[string]map[string]bool, now time.Time) {

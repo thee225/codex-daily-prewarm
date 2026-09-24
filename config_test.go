@@ -10,10 +10,10 @@ func TestParsePluginConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AutomaticEnabled || cfg.Schedule != "0 5,10,15,20 * * *" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-6-luna" || cfg.FallbackModel != "gpt-5.6-luna" || cfg.Prompt != "hi" || cfg.ExpectedAccountCount != 0 || cfg.UnknownQuotaPolicy != "skip" {
+	if cfg.AutomaticEnabled || cfg.Schedule != "0 5-23 * * *" || cfg.ResetFollowupMode != "observe" || cfg.Timezone != "Asia/Shanghai" || cfg.Model != "gpt-6-luna" || cfg.FallbackModel != "gpt-5.6-luna" || cfg.Prompt != "hi" || cfg.ExpectedAccountCount != 0 || cfg.UnknownQuotaPolicy != "skip" {
 		t.Fatalf("unexpected defaults: %#v", cfg.public())
 	}
-	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 0, 0, 0, cfg.Location)); got.Hour() != 10 || got.Minute() != 0 {
+	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 0, 0, 0, cfg.Location)); got.Hour() != 6 || got.Minute() != 0 {
 		t.Fatalf("next run = %v", got)
 	}
 }
@@ -50,6 +50,7 @@ func TestParsePluginConfigRejectsUnsafeValues(t *testing.T) {
 		"state":           "state_path: relative.json",
 		"count":           "expected_account_count: -1",
 		"unknown policy":  "unknown_quota_policy: always",
+		"followup mode":   "reset_followup_mode: always",
 		"mixed schedules": "schedule: '0 6 * * *'\njobs:\n  - name: noon\n    schedule: '0 12 * * *'",
 		"duplicate jobs":  "jobs:\n  - name: morning\n    schedule: '0 6 * * *'\n  - name: morning\n    schedule: '0 12 * * *'",
 		"invalid job":     "jobs:\n  - name: bad/job\n    schedule: '0 6 * * *'",
@@ -68,7 +69,7 @@ func TestParseMultipleJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.SyncOnFirstUse || len(cfg.Jobs) != 2 || cfg.Jobs[0].Model != "gpt-5.6-luna" || cfg.Jobs[1].Model != "gpt-5.4" || cfg.Jobs[1].Prompt != "hello" {
+	if len(cfg.Jobs) != 2 || cfg.Jobs[0].Model != "gpt-5.6-luna" || cfg.Jobs[1].Model != "gpt-5.4" || cfg.Jobs[1].Prompt != "hello" {
 		t.Fatalf("jobs = %#v", cfg.Jobs)
 	}
 	if got := cfg.Jobs[1].CronSchedule.Next(time.Date(2026, 9, 23, 17, 0, 0, 0, cfg.Location)); got.Hour() != 18 {
