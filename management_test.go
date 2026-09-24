@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -44,5 +45,17 @@ func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
 	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/resource/plugins/codex-daily-prewarm/run-now"})
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("unauthenticated resource POST status = %d", response.StatusCode)
+	}
+}
+
+func TestStatusPageDisplaysConfiguredTimezone(t *testing.T) {
+	cfg := defaultPluginConfig().public()
+	page := renderStatusPage(runtimeStatus{
+		Config:    cfg,
+		NextRunAt: time.Date(2026, 9, 24, 10, 0, 38, 0, time.UTC),
+		Accounts:  map[string]accountWindow{"acct-test": {FiveHourFollowupAt: time.Date(2026, 9, 24, 11, 9, 18, 0, time.UTC)}},
+	})
+	if !strings.Contains(page, "2026-09-24 18:00:38 CST") || !strings.Contains(page, "2026-09-24 19:09:18 CST") {
+		t.Fatal("planned times were not shown in Asia/Shanghai")
 	}
 }

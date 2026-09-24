@@ -105,9 +105,13 @@ func htmlManagementResponse(body string) pluginapi.ManagementResponse {
 }
 
 func renderStatusPage(status runtimeStatus) string {
+	location, err := time.LoadLocation(status.Config.Timezone)
+	if err != nil {
+		location = time.UTC
+	}
 	next := "未计划"
 	if !status.NextRunAt.IsZero() {
-		next = status.NextRunAt.Format("2006-01-02 15:04:05 MST")
+		next = status.NextRunAt.In(location).Format("2006-01-02 15:04:05 MST")
 	}
 	last := "尚未运行"
 	if status.LastRun != nil {
@@ -116,7 +120,7 @@ func renderStatusPage(status runtimeStatus) string {
 	var plans strings.Builder
 	followupMode := map[string]string{"off": "关闭", "observe": "只读观察", "active": "符合条件时预热"}[status.Config.ResetFollowupMode]
 	for _, job := range status.NextRuns {
-		plans.WriteString("<dd><code>" + html.EscapeString(job.Name) + "</code> · " + html.EscapeString(job.Schedule) + " · " + html.EscapeString(job.Model) + " · " + html.EscapeString(job.NextRunAt.Format("2006-01-02 15:04 MST")) + "</dd>")
+		plans.WriteString("<dd><code>" + html.EscapeString(job.Name) + "</code> · " + html.EscapeString(job.Schedule) + " · " + html.EscapeString(job.Model) + " · " + html.EscapeString(job.NextRunAt.In(location).Format("2006-01-02 15:04 MST")) + "</dd>")
 	}
 	var accounts strings.Builder
 	var followups strings.Builder
@@ -132,7 +136,7 @@ func renderStatusPage(status runtimeStatus) string {
 			at   time.Time
 		}{{"五小时", window.FiveHourFollowupAt}, {"周", window.WeeklyFollowupAt}, {"查询重试", window.QuotaRetryAt}} {
 			if !plan.at.IsZero() {
-				followups.WriteString("<tr><td>" + html.EscapeString(account) + "</td><td>" + plan.kind + "</td><td>" + html.EscapeString(plan.at.Format("2006-01-02 15:04:05 MST")) + "</td></tr>")
+				followups.WriteString("<tr><td>" + html.EscapeString(account) + "</td><td>" + plan.kind + "</td><td>" + html.EscapeString(plan.at.In(location).Format("2006-01-02 15:04:05 MST")) + "</td></tr>")
 			}
 		}
 	}
