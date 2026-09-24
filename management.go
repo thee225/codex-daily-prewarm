@@ -20,7 +20,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "读取插件状态与最近一次执行结果。"},
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/history", Description: "读取最近 30 次匿名化执行历史。"},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；请求体可传 {\"force\":true}。"},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；可传 {\"notify\":true} 验证 Bark；安全门槛始终生效。"},
 		},
 	}
 }
@@ -47,15 +47,16 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 		return jsonManagementResponse(http.StatusOK, map[string]any{"history": app.history()})
 	case method == http.MethodPost && pathEndsWith(request.Path, "/run-now"):
 		var input struct {
-			Force bool   `json:"force"`
-			Job   string `json:"job"`
+			Force  bool   `json:"force"`
+			Notify bool   `json:"notify"`
+			Job    string `json:"job"`
 		}
 		if len(request.Body) > 0 {
 			if err := json.Unmarshal(request.Body, &input); err != nil {
 				return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "invalid_json"})
 			}
 		}
-		if err := app.startNamedRun("manual", input.Job, input.Force); err != nil {
+		if err := app.startNamedRunWithNotify("manual", input.Job, input.Force, input.Notify); err != nil {
 			if err == errJobNotFound {
 				return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "job_not_found"})
 			}
@@ -64,7 +65,7 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 			}
 			return jsonManagementResponse(http.StatusServiceUnavailable, map[string]any{"error": safeErrorCode(err)})
 		}
-		return jsonManagementResponse(http.StatusAccepted, map[string]any{"accepted": true, "force": input.Force, "job": input.Job})
+		return jsonManagementResponse(http.StatusAccepted, map[string]any{"accepted": true, "force": input.Force, "notify": input.Notify, "job": input.Job})
 	default:
 		return jsonManagementResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 	}
@@ -113,5 +114,15 @@ func renderStatusPage(status runtimeStatus) string {
 	for _, job := range status.NextRuns {
 		plans.WriteString("<dd><code>" + html.EscapeString(job.Name) + "</code> · " + html.EscapeString(job.Schedule) + " · " + html.EscapeString(job.Model) + " · " + html.EscapeString(job.NextRunAt.Format("2006-01-02 15:04 MST")) + "</dd>")
 	}
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}</style></head><body><h1>Codex 每日预热</h1><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>首次使用同步</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.SyncOnFirstUse]) + `</dd><dt>上次首次使用同步</dt><dd>` + html.EscapeString(lastSync) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><p>完整匿名化历史和立即运行操作位于 CPA 管理 API。</p></body></html>`
+	var accounts strings.Builder
+	if status.LastRun != nil {
+		for _, item := range status.LastRun.Accounts {
+			quota := "未知"
+			if !item.QuotaCheckedAt.IsZero() {
+				quota = fmt.Sprintf("%.0f%% / %.0f%%", 100-item.FiveHour.UsedPercent, 100-item.Weekly.UsedPercent)
+			}
+			accounts.WriteString("<tr><td>" + html.EscapeString(item.Account) + "</td><td>" + html.EscapeString(item.QuotaStatus) + "</td><td>" + quota + "</td><td>" + html.EscapeString(item.SkipReason) + "</td><td>" + fmt.Sprintf("%d", item.Attempts24h) + "</td></tr>")
+		}
+	}
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}</style></head><body><h1>Codex 每日预热</h1><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>首次使用同步</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.SyncOnFirstUse]) + `</dd><dt>上次首次使用同步</dt><dd>` + html.EscapeString(lastSync) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p></body></html>`
 }

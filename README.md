@@ -1,14 +1,18 @@
-# CPA Codex 额度窗口检查插件
+# CPA Codex 额度巡检与预热插件
 
-`codex-daily-prewarm` 是 CLIProxyAPI（CPA）动态插件。它在指定时间点检查每个
-Codex 账号的已观察到的五小时与周额度窗口，或在某账号首次进入新五小时窗口后，
-向五小时额度已恢复且周额度仍可用的其他账号精确发送一次短模型请求。默认检查点为北京时间 05:00、10:00、
-15:00、20:00；检查点不是无条件发请求。
+插件逐账号读取 Codex 上游 `GET /backend-api/wham/usage`，按额度证据决定是否向指定账号发送一次短模型请求。它不参与 CPA 的正常轮询、权重或会话亲和。默认北京时间 05:00、10:00、15:00、20:00 巡检，时间可用 `schedule` 或 `jobs` 修改。
 
-插件不会读取、复制或记录 OAuth Token；请求通过 CPA 的 `host.auth.list` 与
-`host.model.execute` 完成，并使用精确的 `auth_id`，不会依赖普通轮询。
+## 决策规则
 
-## 配置示例
+1. 通过 CPA 宿主的 `host.auth.list` 枚举账号，`host.auth.get` 在进程内取得当前凭据，`host.http.do` 发起只读上游额度查询。无需配置 CPA 管理密钥。凭据与完整响应不写入状态、日志或管理页。
+2. 周额度剩余必须 **大于 5%**，上游 `allowed` 必须为真。五小时已用百分比非零时直接跳过。
+3. 对五小时为 0% 的候选账号，间隔三秒再查询。只有两次查询都显示 0%、五小时重置时间随墙钟前移、周额度持续满足门槛，才判定为尚未使用。查询失败或证据不完整时跳过。
+4. 每个账号至少间隔五小时才允许再预热；每个滚动 24 小时最多五次**实际模型调用**。请求发出前先持久化次数；重试、备用模型、失败及结果不确定的调用都计数。状态写入失败时停止调用。
+5. `dry_run` 默认开启。它执行真实的只读额度查询并记录 `would_warm`，不发模型请求。启用真实预热前应查看运行记录。
+
+普通业务账号首次进入新五小时窗口时，后台合并发起全账号巡检。可信的 `429 usage_limit_reached` 只触发限频的**只读**巡检，不立即预热。两类事件均不改变当前会话的账号选择。
+
+## 配置
 
 ```yaml
 plugins:
@@ -18,6 +22,7 @@ plugins:
     codex-daily-prewarm:
       enabled: true
       automatic_enabled: true
+      dry_run: true
       sync_on_first_use: true
       schedule: "0 5,10,15,20 * * *"
       timezone: "Asia/Shanghai"
@@ -29,75 +34,27 @@ plugins:
       account_spacing: "30s"
       retry_count: 1
       state_path: "/CLIProxyAPI/plugins/state/codex-daily-prewarm.json"
+      # bark_url: "https://你的 Bark 服务地址/设备密钥"
 ```
 
-`expected_account_count: 0` 动态发现可用账号，不把当前的三个账号写死；明确设为
-非零值时才启用数量保护。标准五段 cron `0 5,10,15,20 * * *` 表示每天四次检查。
+`bark_url` 只能放在权限受限的生产 CPA 配置中，不能提交到 Git。状态页只显示是否配置。定时巡检结束后汇总发一条 Bark；北京时间 23:00 至次日 08:00 只记日志。业务事件不推送。`jobs` 可代替 `schedule` 配置多个检查点，每项可包含 `name`、`schedule`、`model`、`prompt`。
 
-`sync_on_first_use` 监听正常业务请求的成功用量事件。插件按响应头中的
-`window_minutes=300` 和 `10080` 区分五小时及周额度，而不是固定将 `primary`
-当作五小时。来源账号进入新五小时窗口才触发同步；同一窗口内小幅波动的重置时间
-不会反复触发。来源账号自身会跳过；目标账号的五小时窗口仍有效、周额度已耗尽，
-或缺少可靠额度数据时，默认不发模型请求。
+## 查看运行情况
 
-`unknown_quota_policy: skip` 是保守模式。若明确接受额度未知时最多一次短请求探测，
-可改为 `probe_once`；探测可能收到周额度 `429`。缺少可验证的上游窗口数据时，
-插件无法证明额度已完全恢复或周额度一定剩余。
-插件自己的请求不会再次触发同步。`429 usage_limit_reached` 不会因切换模型而重试；
-若上游提供重置时间，插件会在到期前跳过该账号。周额度耗尽账号可能被 CPA 标为
-不可用而不进入可用名册；它恢复后会自动参与后续检查点。
+- `GET /v0/resource/plugins/codex-daily-prewarm/status`：中文状态页，展示最近逐账号结果。
+- `GET /v0/management/plugins/codex-daily-prewarm/status`：状态 JSON，包含匿名账号的额度和滚动调用记录。
+- `GET /v0/management/plugins/codex-daily-prewarm/history`：最近 30 次巡检。
+- `POST /v0/management/plugins/codex-daily-prewarm/run-now`：手动发起一轮，仍受额度证据、dry-run 与次数保护；传入 `{"notify":true}` 可验证 Bark 汇总。
 
-主模型默认 `gpt-6-luna`。只有上游明确返回不支持模型的错误，才尝试
-`gpt-5.6-luna`；普通错误、额度不足或结果不确定时不会回退。成功收到回复并不
-证明这次请求“重置”了一个已开启的窗口；应查看历史记录中的五小时与周额度
-窗口长度、已用百分比及重置时间。
+兼容旧调用中的 `force` 参数，但它不越过额度证据、五小时冷却、滚动次数和 dry-run 保护。
 
-如果需要多个独立时间段，可以用 `jobs` 取代 `schedule`。每个任务独立按天去重，
-可以覆写模型和提示词。原来的单条 `schedule` 仍受支持，且旧状态文件无需迁移：
-
-```yaml
-      jobs:
-        - name: default
-          schedule: "0 5 * * *"
-        - name: evening
-          schedule: "0 20 * * *"
-          model: "gpt-6-luna"
-          prompt: "hi"
-```
-
-多个任务也共用逐账号窗口状态，不会因为任务名称不同而重复调用已进入窗口的账号。
-任务同时到点时会排队执行，不会并行争抢账号。`sync_on_first_use` 可以与定时任务同时启用。
-
-`enabled` 是 CPA 的宿主保留字段，决定插件是否加载；`automatic_enabled` 只控制
-每日自动预热。首次部署时保持 `enabled: true`、`automatic_enabled: false`，可在不
-启动定时任务的情况下检查状态并完成手工灰度，灰度成功后再启用自动任务。
-
-## 管理接口
-
-- `GET /v0/resource/plugins/codex-daily-prewarm/status`
-- `GET /v0/management/plugins/codex-daily-prewarm/status`
-- `GET /v0/management/plugins/codex-daily-prewarm/history`
-- `POST /v0/management/plugins/codex-daily-prewarm/run-now`
-
-`run-now` 默认运行第一个任务并遵守逐账号窗口判断；可以传入
-`{"job":"evening"}` 选择任务，或在明确授权的手工灰度中传入 `{"force":true}`。
-
-状态与历史只保存账号匿名指纹、任务名称、模型、返回状态、跳过原因、是否收到有效回复和额度窗口响应头，
-不保存提示词回复正文、Token、Cookie 或认证文件内容。
-
-每次运行还会追加到状态目录的 `codex-daily-prewarm.events.jsonl`：
-`run_started` 记录触发方式和来源账号的匿名指纹，`run_finished` 记录每个账号的
-窗口证据、跳过原因、请求状态和汇总。它使用 `0600` 权限；生产部署由 logrotate
-按天或文件大小轮转并保留 30 份压缩日志。状态页面仍只展示最近 30 次运行，
-需要排查较早运行时查阅 JSONL 及轮转文件。
+持久状态为 `state_path`；同目录的 `codex-daily-prewarm.events.jsonl` 记录 `run_started` 与 `run_finished`，后者包含逐账号查询结果、跳过原因、预热调用数和 Bark 接收状态。文件权限均为 `0600`。
 
 ## 构建
 
-CPA `v7.3.9` 使用 Go `1.26`。Linux amd64 构建：
+与 CPA 宿主一致使用 Go 1.26：
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.4.0
+make build GOOS=linux GOARCH=amd64 VERSION=0.5.0
 ```
-
-输出为 `dist/codex-daily-prewarm.so`。

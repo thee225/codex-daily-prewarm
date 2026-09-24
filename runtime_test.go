@@ -21,7 +21,7 @@ func TestEligibleCodexAuths(t *testing.T) {
 		{Provider: "codex"},
 	}
 	got := eligibleCodexAuths(files)
-	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+	if len(got) != 3 || got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "unavailable" {
 		t.Fatalf("eligible = %#v", got)
 	}
 }

@@ -36,6 +36,9 @@ type runtimeState struct {
 // The old daily map remains readable for rollback, but decisions use the
 // observed, per-account reset time. A missing reset is never called confirmed.
 type accountWindow struct {
+	LastQuotaCheckedAt time.Time   `json:"last_quota_checked_at,omitempty"`
+	QuotaStatus        string      `json:"quota_status,omitempty"`
+	AttemptTimes       []time.Time `json:"attempt_times,omitempty"`
 	ResetAt            time.Time   `json:"reset_at,omitempty"`
 	LastProbeAt        time.Time   `json:"last_probe_at,omitempty"`
 	RetryAfter         time.Time   `json:"retry_after,omitempty"`
@@ -60,6 +63,9 @@ type runRecord struct {
 	Expected           int             `json:"expected_accounts"`
 	Discovered         int             `json:"discovered_accounts"`
 	Attempted          int             `json:"attempted_accounts"`
+	QuotaQueried       int             `json:"quota_queried_accounts"`
+	WouldWarm          int             `json:"would_warm_accounts"`
+	BarkStatus         string          `json:"bark_status,omitempty"`
 	Succeeded          int             `json:"succeeded_accounts"`
 	Skipped            int             `json:"skipped_accounts"`
 	ObservedResetCount int             `json:"observed_reset_accounts"`
@@ -76,6 +82,10 @@ type accountResult struct {
 	StartedAt        time.Time   `json:"started_at"`
 	FinishedAt       time.Time   `json:"finished_at"`
 	Attempts         int         `json:"attempts"`
+	QuotaCheckedAt   time.Time   `json:"quota_checked_at,omitempty"`
+	QuotaStatus      string      `json:"quota_status,omitempty"`
+	Attempts24h      int         `json:"attempts_24h"`
+	WouldWarm        bool        `json:"would_warm,omitempty"`
 	StatusCode       int         `json:"status_code,omitempty"`
 	ResponseReceived bool        `json:"response_received"`
 	FallbackUsed     bool        `json:"fallback_used,omitempty"`
@@ -88,16 +98,17 @@ type accountResult struct {
 }
 
 type runtimeStatus struct {
-	Plugin      string       `json:"plugin"`
-	Version     string       `json:"version"`
-	Config      publicConfig `json:"config"`
-	Running     bool         `json:"running"`
-	NextRunAt   time.Time    `json:"next_run_at,omitempty"`
-	LastError   string       `json:"last_error,omitempty"`
-	LastRun     *runRecord   `json:"last_run,omitempty"`
-	HistorySize int          `json:"history_size"`
-	NextRuns    []jobNextRun `json:"next_runs,omitempty"`
-	LastSyncAt  time.Time    `json:"last_sync_at,omitempty"`
+	Plugin      string                   `json:"plugin"`
+	Version     string                   `json:"version"`
+	Config      publicConfig             `json:"config"`
+	Running     bool                     `json:"running"`
+	NextRunAt   time.Time                `json:"next_run_at,omitempty"`
+	LastError   string                   `json:"last_error,omitempty"`
+	LastRun     *runRecord               `json:"last_run,omitempty"`
+	HistorySize int                      `json:"history_size"`
+	NextRuns    []jobNextRun             `json:"next_runs,omitempty"`
+	LastSyncAt  time.Time                `json:"last_sync_at,omitempty"`
+	Accounts    map[string]accountWindow `json:"accounts,omitempty"`
 }
 
 type jobNextRun struct {
@@ -112,6 +123,8 @@ type runRequest struct {
 	Job          prewarmJob
 	Force        bool
 	SourceAuthID string
+	ReadOnly     bool
+	Notify       bool
 }
 
 type runtime struct {
@@ -125,6 +138,7 @@ type runtime struct {
 	closed             bool
 	lastError          string
 	lastQuotaPersistAt time.Time
+	lastEventAt        time.Time
 }
 
 type authListResponse struct {
@@ -221,6 +235,10 @@ func (r *runtime) startRun(trigger string, force bool) error {
 }
 
 func (r *runtime) startNamedRun(trigger, name string, force bool) error {
+	return r.startNamedRunWithNotify(trigger, name, force, false)
+}
+
+func (r *runtime) startNamedRunWithNotify(trigger, name string, force, notify bool) error {
 	r.mu.RLock()
 	jobs := r.cfg.Jobs
 	r.mu.RUnlock()
@@ -229,7 +247,7 @@ func (r *runtime) startNamedRun(trigger, name string, force bool) error {
 	}
 	for _, job := range jobs {
 		if job.Name == name {
-			return r.startRunJob(runRequest{Trigger: trigger, Job: job, Force: force})
+			return r.startRunJob(runRequest{Trigger: trigger, Job: job, Force: force, Notify: notify})
 		}
 	}
 	return errJobNotFound
@@ -242,7 +260,13 @@ func (r *runtime) startRunJob(request runRequest) error {
 		return errors.New("plugin is shutting down")
 	}
 	if r.running {
-		if request.Trigger == "schedule" || request.Trigger == "first_use" {
+		if request.Trigger == "schedule" || request.Trigger == "first_use" || request.Trigger == "quota_429" {
+			for _, queued := range r.pending {
+				if queued.Trigger == request.Trigger && queued.Job.Name == request.Job.Name {
+					r.mu.Unlock()
+					return nil
+				}
+			}
 			r.pending = append(r.pending, request)
 			r.mu.Unlock()
 			return nil
@@ -301,6 +325,9 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)
 		record.Success = record.ErrorCode == "" && record.Succeeded+record.Skipped == record.Discovered && record.Discovered > 0
+		if request.Trigger == "schedule" || request.Notify {
+			record.BarkStatus = sendScheduleBark(cfg, record)
+		}
 		r.appendRun(cfg, record)
 	}()
 
@@ -323,23 +350,78 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 
 	for index, auth := range auths {
 		fingerprint := accountFingerprint(auth.ID)
-		window := r.accountWindow(fingerprint)
-		if auth.ID == request.SourceAuthID {
-			record.Skipped++
-			record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: "source_account", FiveHour: window.FiveHour, Weekly: window.Weekly})
-			continue
+		result := accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, StartedAt: time.Now().In(cfg.Location)}
+		first, reason := fetchUsage(auth)
+		record.QuotaQueried++
+		if reason != "" {
+			result.QuotaStatus = "query_failed"
+			r.saveQuotaFailure(cfg, fingerprint, reason)
 		}
-		if !request.Force {
-			if reason := r.skipReason(fingerprint, time.Now()); reason != "" {
-				record.Skipped++
-				record.Accounts = append(record.Accounts, accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, SkipReason: reason, FiveHour: window.FiveHour, Weekly: window.Weekly})
-				continue
+		if reason == "" {
+			result.QuotaCheckedAt, result.FiveHour, result.Weekly = first.CheckedAt, first.FiveHour, first.Weekly
+			result.QuotaStatus = "confirmed"
+			if !r.saveQuota(cfg, fingerprint, first) {
+				reason = "state_write_failed"
 			}
+			if reason == "" {
+				if first.Weekly.UsedPercent >= 95 {
+					reason = "weekly_below_threshold"
+				} else if !first.Allowed {
+					reason = "upstream_disallowed"
+				} else if first.FiveHour.UsedPercent != 0 {
+					reason = "active_five_hour_window"
+				} else if request.ReadOnly {
+					reason = "readonly_event"
+				} else {
+					time.Sleep(3 * time.Second)
+					second, secondReason := fetchUsage(auth)
+					if secondReason != "" {
+						reason = "idle_confirmation_" + secondReason
+						result.QuotaStatus = "query_failed"
+						r.saveQuotaFailure(cfg, fingerprint, reason)
+					} else {
+						result.QuotaCheckedAt, result.FiveHour, result.Weekly = second.CheckedAt, second.FiveHour, second.Weekly
+						if !r.saveQuota(cfg, fingerprint, second) {
+							reason = "state_write_failed"
+						} else if !confirmedIdle(first, second) {
+							reason = "five_hour_not_confirmed_idle"
+						}
+					}
+				}
+			}
+		}
+		if reason == "" {
+			if limitReason := r.warmLimitReason(fingerprint, time.Now()); limitReason != "" {
+				reason = limitReason
+			}
+		}
+		if reason == "" && cfg.DryRun {
+			result.WouldWarm = true
+			result.SkipReason = "dry_run"
+			record.WouldWarm++
+			reason = "dry_run"
+		}
+		if reason != "" {
+			result.SkipReason = reason
+			result.FinishedAt = time.Now().In(cfg.Location)
+			result.Attempts24h = r.attemptCount(fingerprint, time.Now())
+			record.Skipped++
+			record.Accounts = append(record.Accounts, result)
+			continue
 		}
 		if record.Attempted > 0 && cfg.AccountSpacing > 0 {
 			time.Sleep(cfg.AccountSpacing)
 		}
-		result := executeAccount(cfg, request.Job, auth)
+		modelResult := executeAccountWithGuard(cfg, request.Job, auth, func() bool {
+			return r.reserveAttempt(cfg, fingerprint, time.Now())
+		})
+		result.Attempts = modelResult.Attempts
+		result.StatusCode = modelResult.StatusCode
+		result.ResponseReceived = modelResult.ResponseReceived
+		result.FallbackUsed = modelResult.FallbackUsed
+		result.ErrorCode = modelResult.ErrorCode
+		result.FinishedAt = modelResult.FinishedAt
+		result.Attempts24h = r.attemptCount(fingerprint, time.Now())
 		record.Attempted++
 		record.Accounts = append(record.Accounts, result)
 		r.recordAccountResult(cfg, fingerprint, result)
@@ -410,11 +492,7 @@ func eligibleCodexAuths(files []pluginapi.HostAuthFileEntry) []pluginapi.HostAut
 		if provider != "codex" && authType != "codex" {
 			continue
 		}
-		if auth.Disabled || auth.Unavailable || strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		status := strings.ToLower(strings.TrimSpace(auth.Status))
-		if status != "" && status != "active" && status != "ready" {
+		if auth.Disabled || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
 		eligible = append(eligible, auth)
@@ -424,6 +502,10 @@ func eligibleCodexAuths(files []pluginapi.HostAuthFileEntry) []pluginapi.HostAut
 }
 
 func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry) accountResult {
+	return executeAccountWithGuard(cfg, job, auth, func() bool { return true })
+}
+
+func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry, reserve func() bool) accountResult {
 	result := accountResult{
 		Account:     accountFingerprint(auth.ID),
 		AccountType: safeAccountType(auth.AccountType),
@@ -446,6 +528,10 @@ func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFil
 		}
 		unsupported := false
 		for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
+			if !reserve() {
+				result.ErrorCode = "attempt_limit_or_state_write_failed"
+				break
+			}
 			result.Attempts++
 			raw, callErr := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
 				HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -725,6 +811,84 @@ func (r *runtime) accountWindow(account string) accountWindow {
 	return r.state.Accounts[account]
 }
 
+func recentAttempts(times []time.Time, now time.Time) []time.Time {
+	kept := make([]time.Time, 0, len(times))
+	for _, at := range times {
+		if !at.IsZero() && at.After(now.Add(-24*time.Hour)) && !at.After(now.Add(time.Minute)) {
+			kept = append(kept, at)
+		}
+	}
+	return kept
+}
+
+func (r *runtime) attemptCount(account string, now time.Time) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(recentAttempts(r.state.Accounts[account].AttemptTimes, now))
+}
+
+func (r *runtime) warmLimitReason(account string, now time.Time) string {
+	r.mu.RLock()
+	window := r.state.Accounts[account]
+	r.mu.RUnlock()
+	if len(recentAttempts(window.AttemptTimes, now)) >= 5 {
+		return "rolling_24h_limit"
+	}
+	if !window.LastPrewarmAt.IsZero() && now.Before(window.LastPrewarmAt.Add(5*time.Hour)) {
+		return "recent_prewarm_attempt"
+	}
+	return ""
+}
+
+// Persist the reservation before sending a model request. A crash or an
+// uncertain callback still consumes one of the five rolling 24-hour slots.
+func (r *runtime) reserveAttempt(cfg pluginConfig, account string, now time.Time) bool {
+	r.mu.Lock()
+	window := r.state.Accounts[account]
+	window.AttemptTimes = recentAttempts(window.AttemptTimes, now)
+	if len(window.AttemptTimes) >= 5 {
+		r.mu.Unlock()
+		return false
+	}
+	window.AttemptTimes = append(window.AttemptTimes, now.UTC())
+	window.LastPrewarmAt = now.UTC()
+	r.state.Accounts[account] = window
+	r.mu.Unlock()
+	if err := r.persistState(cfg.StatePath); err != nil {
+		r.setLastError("state_write_failed")
+		return false
+	}
+	return true
+}
+
+func (r *runtime) saveQuota(cfg pluginConfig, account string, observation quotaObservation) bool {
+	r.mu.Lock()
+	window := r.state.Accounts[account]
+	window.LastQuotaCheckedAt = observation.CheckedAt
+	window.QuotaStatus = observation.Status
+	window.FiveHour = observation.FiveHour
+	window.Weekly = observation.Weekly
+	r.state.Accounts[account] = window
+	r.mu.Unlock()
+	if err := r.persistState(cfg.StatePath); err != nil {
+		r.setLastError("state_write_failed")
+		return false
+	}
+	return true
+}
+
+func (r *runtime) saveQuotaFailure(cfg pluginConfig, account, reason string) {
+	r.mu.Lock()
+	window := r.state.Accounts[account]
+	window.LastQuotaCheckedAt = time.Now().UTC()
+	window.QuotaStatus = reason
+	r.state.Accounts[account] = window
+	r.mu.Unlock()
+	if err := r.persistState(cfg.StatePath); err != nil {
+		r.setLastError("state_write_failed")
+	}
+}
+
 func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result accountResult) {
 	r.mu.Lock()
 	window := r.state.Accounts[account]
@@ -822,6 +986,11 @@ func (r *runtime) status() runtimeStatus {
 	status := runtimeStatus{
 		Plugin: pluginName, Version: pluginVersion, Config: r.cfg.public(), Running: r.running,
 		LastError: r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
+		Accounts: make(map[string]accountWindow, len(r.state.Accounts)),
+	}
+	for account, window := range r.state.Accounts {
+		window.AttemptTimes = recentAttempts(window.AttemptTimes, time.Now())
+		status.Accounts[account] = window
 	}
 	if r.cfg.AutomaticEnabled && r.cfg.Location != nil {
 		for _, job := range r.cfg.Jobs {
@@ -868,6 +1037,27 @@ func readState(path string) (runtimeState, error) {
 	}
 	if state.Accounts == nil {
 		state.Accounts = make(map[string]accountWindow)
+	}
+	// Import recent v0.4 model attempts once so the new rolling limit also
+	// covers calls made shortly before the upgrade.
+	knownAttempts := make(map[string]bool, len(state.Accounts))
+	for account, window := range state.Accounts {
+		knownAttempts[account] = len(window.AttemptTimes) != 0
+	}
+	for _, run := range state.History {
+		for _, result := range run.Accounts {
+			if result.Account == "" || result.Attempts <= 0 || result.FinishedAt.IsZero() {
+				continue
+			}
+			window := state.Accounts[result.Account]
+			if knownAttempts[result.Account] || !result.FinishedAt.After(time.Now().Add(-24*time.Hour)) {
+				continue
+			}
+			for i := 0; i < result.Attempts && i < 5; i++ {
+				window.AttemptTimes = append(window.AttemptTimes, result.FinishedAt)
+			}
+			state.Accounts[result.Account] = window
+		}
 	}
 	// Seed the new per-account view from the previous plugin's bounded history.
 	// This avoids an unnecessary probe immediately after an upgrade.
@@ -938,6 +1128,7 @@ func cloneState(state runtimeState) runtimeState {
 		}
 	}
 	for account, window := range state.Accounts {
+		window.AttemptTimes = append([]time.Time(nil), window.AttemptTimes...)
 		clone.Accounts[account] = window
 	}
 	return clone
@@ -947,6 +1138,20 @@ func cloneState(state runtimeState) runtimeState {
 // window. Host model callbacks have no frontend API key, so they cannot
 // trigger this handler recursively.
 func (r *runtime) handleUsage(record pluginapi.UsageRecord) {
+	if strings.TrimSpace(record.APIKey) != "" && strings.EqualFold(record.Provider, "codex") && record.Failed && record.Failure.StatusCode == http.StatusTooManyRequests && upstreamErrorCode(record.Failure.Body, record.Failure.StatusCode) == "usage_limit_reached" {
+		r.mu.Lock()
+		cfg := r.cfg
+		now := time.Now()
+		if r.closed || !cfg.SyncOnFirstUse || now.Sub(r.lastEventAt) < 5*time.Minute {
+			r.mu.Unlock()
+			return
+		}
+		r.lastEventAt = now
+		r.mu.Unlock()
+		job := prewarmJob{Name: "quota-429", Model: cfg.Model, Prompt: cfg.Prompt}
+		_ = r.startRunJob(runRequest{Trigger: "quota_429", Job: job, ReadOnly: true})
+		return
+	}
 	if !eligibleFirstUse(record) {
 		return
 	}

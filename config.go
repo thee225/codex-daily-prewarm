@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,6 +23,8 @@ const (
 
 type pluginConfig struct {
 	AutomaticEnabled     bool           `json:"automatic_enabled"`
+	DryRun               bool           `json:"dry_run"`
+	BarkURL              string         `json:"-"`
 	SyncOnFirstUse       bool           `json:"sync_on_first_use"`
 	Schedule             string         `json:"schedule"`
 	Timezone             string         `json:"timezone"`
@@ -55,6 +58,8 @@ type yamlPrewarmJob struct {
 
 type yamlPluginConfig struct {
 	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
+	DryRun               *bool            `yaml:"dry_run"`
+	BarkURL              string           `yaml:"bark_url"`
 	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"`
 	Schedule             string           `yaml:"schedule"`
 	Timezone             string           `yaml:"timezone"`
@@ -74,6 +79,7 @@ func defaultPluginConfig() pluginConfig {
 	schedule, _ := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow).Parse(defaultSchedule)
 	return pluginConfig{
 		AutomaticEnabled:     false,
+		DryRun:               true,
 		Schedule:             defaultSchedule,
 		Timezone:             defaultTimezone,
 		Model:                defaultModel,
@@ -101,6 +107,16 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	if input.AutomaticEnabled != nil {
 		cfg.AutomaticEnabled = *input.AutomaticEnabled
+	}
+	if input.DryRun != nil {
+		cfg.DryRun = *input.DryRun
+	}
+	if input.BarkURL != "" {
+		parsed, err := url.Parse(strings.TrimSpace(input.BarkURL))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return cfg, fmt.Errorf("bark_url must be an HTTPS URL")
+		}
+		cfg.BarkURL = parsed.String()
 	}
 	if input.SyncOnFirstUse != nil {
 		cfg.SyncOnFirstUse = *input.SyncOnFirstUse
@@ -143,8 +159,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if cfg.ExpectedAccountCount < 0 || cfg.ExpectedAccountCount > 100 {
 		return cfg, fmt.Errorf("expected_account_count must be between 0 and 100")
 	}
-	if cfg.UnknownQuotaPolicy != "skip" && cfg.UnknownQuotaPolicy != "probe_once" {
-		return cfg, fmt.Errorf("unknown_quota_policy must be skip or probe_once")
+	if cfg.UnknownQuotaPolicy != "skip" {
+		return cfg, fmt.Errorf("unknown_quota_policy must be skip")
 	}
 	if cfg.AccountSpacing < 0 || cfg.AccountSpacing > time.Hour {
 		return cfg, fmt.Errorf("account_spacing must be between 0 and 1h")
@@ -246,6 +262,8 @@ func validateModel(model string) error {
 
 type publicConfig struct {
 	AutomaticEnabled     bool        `json:"automatic_enabled"`
+	DryRun               bool        `json:"dry_run"`
+	BarkConfigured       bool        `json:"bark_configured"`
 	SyncOnFirstUse       bool        `json:"sync_on_first_use"`
 	Schedule             string      `json:"schedule"`
 	Timezone             string      `json:"timezone"`
@@ -274,6 +292,8 @@ func (cfg pluginConfig) public() publicConfig {
 	}
 	return publicConfig{
 		AutomaticEnabled:     cfg.AutomaticEnabled,
+		DryRun:               cfg.DryRun,
+		BarkConfigured:       cfg.BarkURL != "",
 		SyncOnFirstUse:       cfg.SyncOnFirstUse,
 		Schedule:             cfg.Schedule,
 		Timezone:             cfg.Timezone,
