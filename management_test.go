@@ -32,3 +32,17 @@ func TestRunNowRejectsInvalidJSON(t *testing.T) {
 		t.Fatalf("status = %d", response.StatusCode)
 	}
 }
+
+func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
+	page := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/codex-daily-prewarm/status"})
+	if page.StatusCode != http.StatusOK || !strings.Contains(string(page.Body), "一键预热（先查额度）") {
+		t.Fatalf("resource page status = %d", page.StatusCode)
+	}
+	if !strings.Contains(string(page.Body), "/v0/management/plugins/codex-daily-prewarm") {
+		t.Fatal("button does not use the authenticated management route")
+	}
+	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/resource/plugins/codex-daily-prewarm/run-now"})
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unauthenticated resource POST status = %d", response.StatusCode)
+	}
+}

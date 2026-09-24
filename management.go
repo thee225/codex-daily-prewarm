@@ -39,13 +39,13 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 		method = http.MethodGet
 	}
 	switch {
-	case method == http.MethodGet && pathEndsWith(request.Path, "/status") && strings.Contains(request.Path, "/resource/"):
+	case method == http.MethodGet && isResourceStatusPath(request.Path):
 		return htmlManagementResponse(renderStatusPage(app.status()))
-	case method == http.MethodGet && pathEndsWith(request.Path, "/status"):
+	case method == http.MethodGet && isManagementPath(request.Path, "/status"):
 		return jsonManagementResponse(http.StatusOK, app.status())
-	case method == http.MethodGet && pathEndsWith(request.Path, "/history"):
+	case method == http.MethodGet && isManagementPath(request.Path, "/history"):
 		return jsonManagementResponse(http.StatusOK, map[string]any{"history": app.history()})
-	case method == http.MethodPost && pathEndsWith(request.Path, "/run-now"):
+	case method == http.MethodPost && isManagementPath(request.Path, "/run-now"):
 		var input struct {
 			Force  bool   `json:"force"`
 			Notify bool   `json:"notify"`
@@ -71,9 +71,14 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 	}
 }
 
-func pathEndsWith(path, suffix string) bool {
+func isManagementPath(path, suffix string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
-	return strings.HasSuffix(path, strings.TrimRight(suffix, "/"))
+	return path == managementRoutePrefix+suffix || path == "/v0/management"+managementRoutePrefix+suffix
+}
+
+func isResourceStatusPath(path string) bool {
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	return path == "/v0/resource"+managementRoutePrefix+"/status" || path == "/resource"+managementRoutePrefix+"/status"
 }
 
 func jsonManagementResponse(status int, value any) pluginapi.ManagementResponse {
@@ -124,5 +129,83 @@ func renderStatusPage(status runtimeStatus) string {
 			accounts.WriteString("<tr><td>" + html.EscapeString(item.Account) + "</td><td>" + html.EscapeString(item.QuotaStatus) + "</td><td>" + quota + "</td><td>" + html.EscapeString(item.SkipReason) + "</td><td>" + fmt.Sprintf("%d", item.Attempts24h) + "</td></tr>")
 		}
 	}
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}</style></head><body><h1>Codex 每日预热</h1><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>首次使用同步</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.SyncOnFirstUse]) + `</dd><dt>上次首次使用同步</dt><dd>` + html.EscapeString(lastSync) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p></body></html>`
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}button{background:#175cd3;color:#fff;border:0;border-radius:8px;padding:10px 16px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.hint{color:#667085;font-size:14px}</style></head><body><h1>Codex 每日预热</h1><section><h2>立即预热</h2><p>立即查询全部账号额度；符合现有条件的账号马上发起一次轻量请求，其余账号跳过。仍受灰度名单、dry-run、五小时冷却和每日次数限制。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>首次使用同步</dt><dd>` + html.EscapeString(lastSync) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p>` + statusPageActionScript + `</body></html>`
 }
+
+// The resource page is public. Only the authenticated management route may start a run.
+// The CPA panel stores its remembered management key obfuscated in localStorage;
+// the page reads it only on an explicit click and sends it only to this origin.
+const statusPageActionScript = `<script>
+(() => {
+  const button = document.getElementById('run-now');
+  const message = document.getElementById('run-result');
+  const route = '/v0/management/plugins/codex-daily-prewarm';
+  let sessionKey = '';
+  let ignoreRememberedKey = false;
+
+  function rememberedKey() {
+    try {
+      let value = localStorage.getItem('managementKey');
+      if (!value) return '';
+      if (value.startsWith('enc::v1::')) {
+        const secret = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
+        const encoded = atob(value.slice(9));
+        const bytes = new Uint8Array(encoded.length);
+        for (let i = 0; i < encoded.length; i++) bytes[i] = encoded.charCodeAt(i) ^ secret[i % secret.length];
+        value = new TextDecoder().decode(bytes);
+      }
+      try { value = JSON.parse(value); } catch (_) { /* Legacy plain text. */ }
+      return typeof value === 'string' ? value : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async function managementRequest(path, options, key) {
+    const response = await fetch(route + path, {
+      ...options,
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: {'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}
+    });
+    if (response.status === 401 || response.status === 403) throw new Error('管理认证失败，请在 CPA 面板重新登录');
+    const body = await response.json();
+    if (!response.ok) {
+      if (response.status === 409) throw new Error('已有巡检正在运行，请稍后再试');
+      throw new Error('巡检未启动：' + (body.error || response.status));
+    }
+    return body;
+  }
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      let key = sessionKey || (!ignoreRememberedKey && rememberedKey());
+      if (!key) key = window.prompt('请输入 CPA 管理密钥（仅用于本次页面请求，不保存）') || '';
+      if (!key) { message.textContent = '已取消。'; return; }
+      sessionKey = key;
+      message.textContent = '正在启动巡检…';
+      const before = await managementRequest('/status', {method: 'GET'}, key);
+      const previousID = before.last_run && before.last_run.id;
+      await managementRequest('/run-now', {method: 'POST', body: '{}'}, key);
+      message.textContent = '已启动，正在逐账号查询并按规则预热…';
+      for (let i = 0; i < 90; i++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const state = await managementRequest('/status', {method: 'GET'}, key);
+        const result = state.last_run;
+        if (result && result.id !== previousID && result.trigger === 'manual') {
+          message.textContent = '已完成：查询 ' + result.quota_queried_accounts + ' 个，预热请求 ' + result.attempted_accounts + ' 个，跳过 ' + result.skipped_accounts + ' 个。页面即将刷新。';
+          setTimeout(() => location.reload(), 1800);
+          return;
+        }
+      }
+      message.textContent = '巡检已启动但仍未完成，请稍后刷新页面查看结果。';
+    } catch (error) {
+      message.textContent = error instanceof Error ? error.message : '巡检失败，请查看 CPA 日志';
+      if (message.textContent.includes('认证失败')) { sessionKey = ''; ignoreRememberedKey = true; }
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>`

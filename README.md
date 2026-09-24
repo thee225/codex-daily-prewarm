@@ -44,7 +44,7 @@ plugins:
 
 ## 查看运行情况
 
-- `GET /v0/resource/plugins/codex-daily-prewarm/status`：中文状态页，展示最近逐账号结果。
+- `GET /v0/resource/plugins/codex-daily-prewarm/status`：中文状态页，展示最近逐账号结果，并提供“一键预热（先查额度）”按钮。点击后立刻查询全部账号，符合条件的账号马上发起轻量模型请求；其余账号记录跳过原因，不等待下一个定时点。按钮调用需 CPA 管理认证，面板记住管理密钥时可直接使用；未记住时页面会在点击时询问一次，且不保存输入。
 - `GET /v0/management/plugins/codex-daily-prewarm/status`：状态 JSON，包含匿名账号的额度和滚动调用记录。
 - `GET /v0/management/plugins/codex-daily-prewarm/history`：最近 30 次巡检。
 - `POST /v0/management/plugins/codex-daily-prewarm/run-now`：手动发起一轮，仍受额度证据、dry-run 与次数保护；传入 `{"notify":true}` 可验证 Bark 汇总。
@@ -59,5 +59,5 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.5.3
+make build GOOS=linux GOARCH=amd64 VERSION=0.5.4
 ```
