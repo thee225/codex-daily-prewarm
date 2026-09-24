@@ -115,7 +115,14 @@ func renderStatusPage(status runtimeStatus) string {
 	}
 	last := "尚未运行"
 	if status.LastRun != nil {
-		last = fmt.Sprintf("%s（%s），成功 %d/%d，错误 %s", status.LastRun.FinishedAt.Format("2006-01-02 15:04:05 MST"), status.LastRun.Job, status.LastRun.Succeeded, status.LastRun.Discovered, status.LastRun.ErrorCode)
+		lastError := status.LastRun.ErrorCode
+		if lastError == "" {
+			lastError = "无"
+		}
+		last = fmt.Sprintf("%s（%s），查询账号 %d/%d，符合预热 %d，预热账号 %d，有效模型回复 %d，跳过 %d，错误 %s",
+			status.LastRun.FinishedAt.In(location).Format("2006-01-02 15:04:05 MST"), status.LastRun.Job,
+			status.LastRun.QuotaQueried, status.LastRun.Discovered, status.LastRun.WouldWarm,
+			status.LastRun.Attempted, status.LastRun.Succeeded, status.LastRun.Skipped, lastError)
 	}
 	var plans strings.Builder
 	followupMode := map[string]string{"off": "关闭", "observe": "只读观察", "active": "符合条件时预热"}[status.Config.ResetFollowupMode]
@@ -146,7 +153,11 @@ func renderStatusPage(status runtimeStatus) string {
 			if !item.QuotaCheckedAt.IsZero() {
 				quota = fmt.Sprintf("%.0f%% / %.0f%%", 100-item.FiveHour.UsedPercent, 100-item.Weekly.UsedPercent)
 			}
-			accounts.WriteString("<tr><td>" + html.EscapeString(item.Account) + "</td><td>" + html.EscapeString(item.QuotaStatus) + "</td><td>" + quota + "</td><td>" + html.EscapeString(item.SkipReason) + "</td><td>" + fmt.Sprintf("%d", item.Attempts24h) + "</td></tr>")
+			reason := item.SkipReason
+			if reason == "followup_observe" {
+				reason = "观察模式：符合预热条件，未发模型请求"
+			}
+			accounts.WriteString("<tr><td>" + html.EscapeString(item.Account) + "</td><td>" + html.EscapeString(item.QuotaStatus) + "</td><td>" + quota + "</td><td>" + html.EscapeString(reason) + "</td><td>" + fmt.Sprintf("%d", item.Attempts24h) + "</td></tr>")
 		}
 	}
 	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.hint{color:#667085;font-size:14px}</style></head><body><h1>Codex 每日预热</h1><section><h2>立即预热</h2><p>立即查询全部账号额度；符合现有条件的账号马上发起一次轻量请求，其余账号跳过。仍受灰度名单、dry-run、五小时冷却和滚动 24 小时次数限制。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>重置补查</dt><dd>` + html.EscapeString(followupMode) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>待执行的账号补查</h2><table><tr><th>匿名账号</th><th>类型</th><th>计划时间</th></tr>` + followups.String() + `</table></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p>` + statusPageActionScript + `</body></html>`

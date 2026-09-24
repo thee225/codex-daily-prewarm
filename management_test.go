@@ -53,9 +53,17 @@ func TestStatusPageDisplaysConfiguredTimezone(t *testing.T) {
 	page := renderStatusPage(runtimeStatus{
 		Config:    cfg,
 		NextRunAt: time.Date(2026, 9, 24, 10, 0, 38, 0, time.UTC),
-		Accounts:  map[string]accountWindow{"acct-test": {FiveHourFollowupAt: time.Date(2026, 9, 24, 11, 9, 18, 0, time.UTC)}},
+		LastRun: &runRecord{
+			Job: "default", FinishedAt: time.Date(2026, 9, 24, 11, 9, 22, 0, time.UTC),
+			Discovered: 1, QuotaQueried: 1, WouldWarm: 1, Skipped: 1,
+			Accounts: []accountResult{{Account: "acct-test", SkipReason: "followup_observe"}},
+		},
+		Accounts: map[string]accountWindow{"acct-test": {FiveHourFollowupAt: time.Date(2026, 9, 24, 11, 9, 18, 0, time.UTC)}},
 	})
 	if !strings.Contains(page, "2026-09-24 18:00:38 CST") || !strings.Contains(page, "2026-09-24 19:09:18 CST") {
 		t.Fatal("planned times were not shown in Asia/Shanghai")
+	}
+	if !strings.Contains(page, "查询账号 1/1，符合预热 1，预热账号 0，有效模型回复 0，跳过 1，错误 无") || !strings.Contains(page, "观察模式：符合预热条件，未发模型请求") || strings.Contains(page, "成功 0/1") {
+		t.Fatal("observation was presented as a failed model request")
 	}
 }
