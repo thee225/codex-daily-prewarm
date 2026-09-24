@@ -187,7 +187,7 @@ const statusPageActionScript = `<script>
       message.textContent = '正在启动巡检…';
       const before = await managementRequest('/status', {method: 'GET'}, key);
       const previousID = before.last_run && before.last_run.id;
-      await managementRequest('/run-now', {method: 'POST', body: '{}'}, key);
+      await managementRequest('/run-now', {method: 'POST', body: '{"notify":true}'}, key);
       message.textContent = '已启动，正在逐账号查询并按规则预热…';
       for (let i = 0; i < 90; i++) {
         await new Promise(resolve => setTimeout(resolve, 2000));
