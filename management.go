@@ -107,7 +107,7 @@ func htmlManagementResponse(body string) pluginapi.ManagementResponse {
 // Resource routes are public on some CPA installations. Load account details
 // only through the already authenticated management status route.
 func renderStatusShell(model string) string {
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><p class="hint">巡检模型：` + html.EscapeString(model) + `</p><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><p class="hint">巡检模型：` + html.EscapeString(model) + `</p><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><button id="unlock-status" type="button" hidden>验证并查看详情</button><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
 }
 
 func renderStatusPage(status runtimeStatus) string {
@@ -170,20 +170,21 @@ func renderStatusPage(status runtimeStatus) string {
 }
 
 // The resource page is public. Only the authenticated management route may start a run.
-// The CPA panel stores its remembered management key obfuscated in localStorage;
-// the page reads it only on an explicit click and sends it only to this origin.
+// The CPA panel stores its remembered management key in the persisted auth store.
+// The public page only loads account details from the authenticated management route.
 const statusPageActionScript = `<script>
 (() => {
   const button = document.getElementById('run-now');
   const message = document.getElementById('run-result');
   const details = document.getElementById('status-details');
+  const unlock = document.getElementById('unlock-status');
   const route = '/v0/management/plugins/codex-daily-prewarm';
   let sessionKey = '';
   let ignoreRememberedKey = false;
 
   function rememberedKey() {
     try {
-      let value = localStorage.getItem('managementKey');
+      let value = localStorage.getItem('cli-proxy-auth');
       if (!value) return '';
       if (value.startsWith('enc::v1::')) {
         const secret = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
@@ -192,8 +193,9 @@ const statusPageActionScript = `<script>
         for (let i = 0; i < encoded.length; i++) bytes[i] = encoded.charCodeAt(i) ^ secret[i % secret.length];
         value = new TextDecoder().decode(bytes);
       }
-      try { value = JSON.parse(value); } catch (_) { /* Legacy plain text. */ }
-      return typeof value === 'string' ? value : '';
+      const auth = JSON.parse(value);
+      if (!auth || !auth.state || auth.state.rememberPassword !== true) return '';
+      return typeof auth.state.managementKey === 'string' ? auth.state.managementKey : '';
     } catch (_) {
       return '';
     }
@@ -218,9 +220,14 @@ const statusPageActionScript = `<script>
   async function loadStatus() {
     if (!details) return;
     const key = sessionKey || (!ignoreRememberedKey && rememberedKey());
-    if (!key) { details.textContent = '请先在 CPA 面板登录，然后刷新本页查看详情。'; return; }
+    if (!key) {
+      unlock.hidden = false;
+      details.textContent = 'CPA 面板未保存管理密钥；可验证一次后查看详情，或在面板登录时选择“记住密钥”。';
+      return;
+    }
     try {
       const state = await managementRequest('/status', {method: 'GET'}, key);
+      unlock.hidden = true;
       const last = state.last_run;
       const lines = [
         '自动任务：' + (state.config.automatic_enabled ? '已启用' : '已停用'),
@@ -243,11 +250,19 @@ const statusPageActionScript = `<script>
       }
       details.textContent = lines.join('\n');
     } catch (error) {
+      unlock.hidden = false;
       details.textContent = error instanceof Error ? error.message : '状态加载失败';
     }
   }
 
   loadStatus();
+
+  unlock.addEventListener('click', () => {
+    const key = window.prompt('请输入 CPA 管理密钥（仅用于本页，不保存）') || '';
+    if (!key) return;
+    sessionKey = key;
+    loadStatus();
+  });
 
   button.addEventListener('click', async () => {
     button.disabled = true;

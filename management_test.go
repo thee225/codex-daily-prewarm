@@ -53,6 +53,14 @@ func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
 	if strings.Contains(string(page.Body), "acct-012345abcdef") || strings.Contains(string(page.Body), "private-run-id") {
 		t.Fatal("public resource leaked account or run details")
 	}
+	for _, required := range []string{"localStorage.getItem('cli-proxy-auth')", "auth.state.rememberPassword !== true", "auth.state.managementKey", "id=\"unlock-status\"", "验证并查看详情"} {
+		if !strings.Contains(string(page.Body), required) {
+			t.Fatalf("resource page missing CPA auth integration: %q", required)
+		}
+	}
+	if strings.Contains(string(page.Body), "localStorage.getItem('managementKey')") {
+		t.Fatal("resource page still reads the CPA legacy storage key")
+	}
 	managed := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/codex-daily-prewarm/status"})
 	if !strings.Contains(string(managed.Body), "acct-012345abcdef") {
 		t.Fatal("management status lost account details")
