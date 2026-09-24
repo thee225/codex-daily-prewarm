@@ -217,6 +217,12 @@ const statusPageActionScript = `<script>
     return body;
   }
 
+  function formatTime(value, timezone) {
+    if (!value || value.startsWith('0001-01-01')) return '';
+    const at = new Date(value);
+    return Number.isNaN(at.getTime()) ? '' : at.toLocaleString('zh-CN', {timeZone: timezone, hour12: false});
+  }
+
   async function loadStatus() {
     if (!details) return;
     const key = sessionKey || (!ignoreRememberedKey && rememberedKey());
@@ -234,13 +240,14 @@ const statusPageActionScript = `<script>
         'dry-run：' + (state.config.dry_run ? '开启' : '关闭'),
         '重置补查：' + state.config.reset_followup_mode,
         '当前：' + (state.running ? '运行中' : '空闲'),
-        '下次运行：' + (state.next_run_at ? new Date(state.next_run_at).toLocaleString('zh-CN', {timeZone: state.config.timezone}) : '未计划'),
-        '最近运行：' + (last ? [last.finished_at, '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '跳过 ' + last.skipped_accounts, 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
+        '下次运行：' + (formatTime(state.next_run_at, state.config.timezone) || '未计划'),
+        '最近运行：' + (last ? [formatTime(last.finished_at, state.config.timezone), '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '跳过 ' + last.skipped_accounts, 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
         '', '待执行账号补查：'
       ];
       for (const [account, window] of Object.entries(state.accounts || {}).sort()) {
         for (const [label, field] of [['5h', 'five_hour_followup_at'], ['周', 'weekly_followup_at'], ['查询重试', 'quota_retry_at']]) {
-          if (window[field]) lines.push(account + ' · ' + label + ' · ' + window[field]);
+          const at = formatTime(window[field], state.config.timezone);
+          if (at) lines.push(account + ' · ' + label + ' · ' + at);
         }
       }
       lines.push('', '最近逐账号检查：');
