@@ -58,7 +58,8 @@ type yamlPrewarmJob struct {
 }
 
 type yamlPluginConfig struct {
-	Enabled              *bool            `yaml:"enabled"` // CPA controls loading; the plugin does not use it.
+	Enabled              *bool            `yaml:"enabled"`  // CPA controls loading; the plugin does not use it.
+	Priority             *int             `yaml:"priority"` // CPA host ordering; not a prewarm policy.
 	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
 	DryRun               *bool            `yaml:"dry_run"`
 	BarkURL              string           `yaml:"bark_url"`

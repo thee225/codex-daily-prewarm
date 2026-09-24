@@ -61,5 +61,5 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.6.3
+make build GOOS=linux GOARCH=amd64 VERSION=0.6.4
 ```

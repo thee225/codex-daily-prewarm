@@ -19,7 +19,7 @@ func TestParsePluginConfigDefaults(t *testing.T) {
 }
 
 func TestParsePluginConfigCustom(t *testing.T) {
-	raw := []byte("enabled: true\nautomatic_enabled: true\nschedule: '10 5 * * *'\ntimezone: Asia/Shanghai\nmodel: gpt-5.4\nprompt: hello\nexpected_account_count: 4\naccount_spacing: 5s\nretry_count: 0\nstate_path: /tmp/prewarm.json\n")
+	raw := []byte("enabled: true\npriority: 0\nautomatic_enabled: true\nschedule: '10 5 * * *'\ntimezone: Asia/Shanghai\nmodel: gpt-5.4\nprompt: hello\nexpected_account_count: 4\naccount_spacing: 5s\nretry_count: 0\nstate_path: /tmp/prewarm.json\n")
 	cfg, err := parsePluginConfig(raw)
 	if err != nil {
 		t.Fatal(err)
