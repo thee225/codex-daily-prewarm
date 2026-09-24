@@ -42,7 +42,7 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 	}
 	switch {
 	case method == http.MethodGet && isResourceStatusPath(request.Path):
-		return htmlManagementResponse(renderStatusShell())
+		return htmlManagementResponse(renderStatusShell(app.status().Config.Model))
 	case method == http.MethodGet && isManagementPath(request.Path, "/status"):
 		return jsonManagementResponse(http.StatusOK, app.status())
 	case method == http.MethodGet && isManagementPath(request.Path, "/history"):
@@ -106,8 +106,8 @@ func htmlManagementResponse(body string) pluginapi.ManagementResponse {
 
 // Resource routes are public on some CPA installations. Load account details
 // only through the already authenticated management status route.
-func renderStatusShell() string {
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
+func renderStatusShell(model string) string {
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><p class="hint">巡检模型：` + html.EscapeString(model) + `</p><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
 }
 
 func renderStatusPage(status runtimeStatus) string {

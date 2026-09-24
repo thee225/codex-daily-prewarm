@@ -44,6 +44,9 @@ func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
 	if page.StatusCode != http.StatusOK || !strings.Contains(string(page.Body), "一键预热（先查额度）") {
 		t.Fatalf("resource page status = %d", page.StatusCode)
 	}
+	if !strings.Contains(string(page.Body), defaultModel) {
+		t.Fatal("public aggregate model missing; deployment health check would fail")
+	}
 	if !strings.Contains(string(page.Body), "/v0/management/plugins/codex-daily-prewarm") {
 		t.Fatal("button does not use the authenticated management route")
 	}
