@@ -204,7 +204,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodUsageHandle:
 		// Older hosts may still call this route. Business usage never schedules work.
 		return okEnvelope(map[string]any{"accepted": true})
-	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+	case pluginabi.MethodPluginQuiesce:
+		app.quiesceOnly()
+		return okEnvelope(map[string]any{"stopped": true})
+	case pluginabi.MethodPluginShutdown:
 		app.shutdown()
 		return okEnvelope(map[string]any{"stopped": true})
 	default:

@@ -133,6 +133,7 @@ type jobNextRun struct {
 }
 
 type runRequest struct {
+	Generation    uint64
 	Trigger       string
 	Job           prewarmJob
 	Force         bool
@@ -149,7 +150,11 @@ type runRequest struct {
 }
 
 type runtime struct {
+	lifecycleMu    sync.Mutex
+	terminal       bool // guarded by lifecycleMu; native shutdown cannot be reopened
 	mu             sync.RWMutex
+	runWG          sync.WaitGroup
+	generation     uint64
 	persistMu      sync.Mutex
 	cfg            pluginConfig
 	cron           *cron.Cron
@@ -160,6 +165,7 @@ type runtime struct {
 	pending        []runRequest
 	closed         bool
 	lastError      string
+	runTask        func(pluginConfig, runRequest) runRecord // test seam; nil uses executeRun
 }
 
 type authListResponse struct {
@@ -190,7 +196,7 @@ type hostLogRequest struct {
 
 func newRuntime() *runtime {
 	cfg := defaultPluginConfig()
-	return &runtime{cfg: cfg, state: newState()}
+	return &runtime{cfg: cfg, state: newState(), generation: 1}
 }
 
 func newState() runtimeState {
@@ -202,23 +208,15 @@ func (r *runtime) configure(raw []byte) error {
 	if err != nil {
 		return err
 	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.terminal {
+		return errors.New("plugin has been shut down")
+	}
+	r.quiesce()
 	state, stateErr := readState(cfg.StatePath)
 	if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
 		return fmt.Errorf("load state: %w", stateErr)
-	}
-
-	r.mu.Lock()
-	previous := r.cron
-	previousScheduler := r.scheduler
-	r.cron = nil
-	r.scheduler = nil
-	r.closed = true
-	r.mu.Unlock()
-	if previous != nil {
-		previous.Stop()
-	}
-	if previousScheduler != nil {
-		previousScheduler.stop()
 	}
 	r.mu.Lock()
 	r.cfg = cfg
@@ -248,19 +246,37 @@ func (r *runtime) configure(raw []byte) error {
 }
 
 func (r *runtime) shutdown() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	r.terminal = true
+	r.quiesce()
+}
+
+func (r *runtime) quiesceOnly() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	r.quiesce()
+}
+
+// quiesce closes the admission gate before stopping producers. It waits for
+// every accepted run before state can be reloaded or the host API unloaded.
+func (r *runtime) quiesce() {
 	r.mu.Lock()
 	r.closed = true
+	r.generation++
+	r.pending = nil
 	c := r.cron
 	scheduler := r.scheduler
 	r.cron = nil
 	r.scheduler = nil
 	r.mu.Unlock()
 	if c != nil {
-		c.Stop()
+		<-c.Stop().Done()
 	}
 	if scheduler != nil {
 		scheduler.stop()
 	}
+	r.runWG.Wait()
 }
 
 var errAlreadyRunning = errors.New("prewarm is already running")
@@ -277,13 +293,14 @@ func (r *runtime) startNamedRun(trigger, name string, force bool) error {
 func (r *runtime) startNamedRunWithNotify(trigger, name string, force, notify bool) error {
 	r.mu.RLock()
 	jobs := r.cfg.Jobs
+	generation := r.generation
 	r.mu.RUnlock()
 	if name == "" && len(jobs) > 0 {
 		name = jobs[0].Name
 	}
 	for _, job := range jobs {
 		if job.Name == name {
-			return r.startRunJob(runRequest{Trigger: trigger, Job: job, Force: force, Notify: notify})
+			return r.startRunJob(runRequest{Generation: generation, Trigger: trigger, Job: job, Force: force, Notify: notify})
 		}
 	}
 	return errJobNotFound
@@ -291,7 +308,7 @@ func (r *runtime) startNamedRunWithNotify(trigger, name string, force, notify bo
 
 func (r *runtime) startRunJob(request runRequest) error {
 	r.mu.Lock()
-	if r.closed {
+	if r.closed || (request.Generation != 0 && request.Generation != r.generation) {
 		r.mu.Unlock()
 		return errors.New("plugin is shutting down")
 	}
@@ -315,6 +332,7 @@ func (r *runtime) startRunJob(request runRequest) error {
 		return errAlreadyRunning
 	}
 	r.running = true
+	r.runWG.Add(1)
 	r.currentRequest = request
 	r.lastError = ""
 	r.mu.Unlock()
@@ -324,11 +342,16 @@ func (r *runtime) startRunJob(request runRequest) error {
 }
 
 func (r *runtime) runQueue(request runRequest) {
+	defer r.runWG.Done()
 	for {
 		r.mu.RLock()
 		cfg := r.cfg
 		r.mu.RUnlock()
-		record := r.executeRun(cfg, request)
+		execute := r.runTask
+		if execute == nil {
+			execute = r.executeRun
+		}
+		record := execute(cfg, request)
 		r.mu.Lock()
 		if record.ErrorCode != "" {
 			r.lastError = record.ErrorCode
@@ -366,6 +389,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	}
 	if err := appendAuditEntry(cfg.StatePath, auditEntry{At: now, Event: "run_started", RunID: record.ID, Trigger: record.Trigger, Job: record.Job, SourceAccount: record.SourceAccount}); err != nil {
 		r.setLastError("audit_write_failed")
+		logHost("error", "codex daily prewarm audit write failed", map[string]any{"error_code": "audit_write_failed"})
 	}
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)

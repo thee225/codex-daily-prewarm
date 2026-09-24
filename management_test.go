@@ -35,12 +35,24 @@ func TestRunNowRejectsInvalidJSON(t *testing.T) {
 }
 
 func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
+	previousApp := app
+	app = newRuntime()
+	defer func() { app = previousApp }()
+	app.state.Accounts["acct-012345abcdef"] = accountWindow{LastPrewarmAt: time.Now()}
+	app.state.History = []runRecord{{ID: "private-run-id", Accounts: []accountResult{{Account: "acct-012345abcdef"}}}}
 	page := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/codex-daily-prewarm/status"})
 	if page.StatusCode != http.StatusOK || !strings.Contains(string(page.Body), "一键预热（先查额度）") {
 		t.Fatalf("resource page status = %d", page.StatusCode)
 	}
 	if !strings.Contains(string(page.Body), "/v0/management/plugins/codex-daily-prewarm") {
 		t.Fatal("button does not use the authenticated management route")
+	}
+	if strings.Contains(string(page.Body), "acct-012345abcdef") || strings.Contains(string(page.Body), "private-run-id") {
+		t.Fatal("public resource leaked account or run details")
+	}
+	managed := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/codex-daily-prewarm/status"})
+	if !strings.Contains(string(managed.Body), "acct-012345abcdef") {
+		t.Fatal("management status lost account details")
 	}
 	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/resource/plugins/codex-daily-prewarm/run-now"})
 	if response.StatusCode != http.StatusNotFound {

@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"net/url"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -58,6 +58,7 @@ type yamlPrewarmJob struct {
 }
 
 type yamlPluginConfig struct {
+	Enabled              *bool            `yaml:"enabled"` // CPA controls loading; the plugin does not use it.
 	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
 	DryRun               *bool            `yaml:"dry_run"`
 	BarkURL              string           `yaml:"bark_url"`
@@ -106,8 +107,14 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		return cfg, nil
 	}
 	var input yamlPluginConfig
-	if err := yaml.Unmarshal(raw, &input); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(raw)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&input); err != nil {
 		return cfg, fmt.Errorf("decode plugin config: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return cfg, fmt.Errorf("decode plugin config: expected exactly one YAML document")
 	}
 	if input.AutomaticEnabled != nil {
 		cfg.AutomaticEnabled = *input.AutomaticEnabled
@@ -116,11 +123,10 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.DryRun = *input.DryRun
 	}
 	if input.BarkURL != "" {
-		parsed, err := url.Parse(strings.TrimSpace(input.BarkURL))
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-			return cfg, fmt.Errorf("bark_url must be an HTTPS URL")
+		if _, _, err := barkPushTarget(input.BarkURL); err != nil {
+			return cfg, err
 		}
-		cfg.BarkURL = parsed.String()
+		cfg.BarkURL = strings.TrimSpace(input.BarkURL)
 	}
 	if len(input.WarmAllowlist) > 0 {
 		if len(input.WarmAllowlist) > 100 {
@@ -221,6 +227,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("schedule must be a standard five-field cron expression: %w", err)
 		}
+		if err := validateDaytimeSchedule(schedule); err != nil {
+			return cfg, err
+		}
 		cfg.CronSchedule = schedule
 		cfg.Jobs = []prewarmJob{{Name: "default", Schedule: cfg.Schedule, Model: cfg.Model, Prompt: cfg.Prompt, CronSchedule: schedule}}
 	} else {
@@ -236,6 +245,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			schedule, err := parser.Parse(scheduleText)
 			if err != nil {
 				return cfg, fmt.Errorf("job %s schedule must be a standard five-field cron expression: %w", name, err)
+			}
+			if err := validateDaytimeSchedule(schedule); err != nil {
+				return cfg, fmt.Errorf("job %s: %w", name, err)
 			}
 			model := cfg.Model
 			if strings.TrimSpace(item.Model) != "" {
@@ -258,6 +270,22 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	}
 	cfg.Location = location
 	return cfg, nil
+}
+
+func validateDaytimeSchedule(schedule cron.Schedule) error {
+	spec, ok := schedule.(*cron.SpecSchedule)
+	if !ok {
+		return fmt.Errorf("schedule must use standard five-field cron syntax")
+	}
+	for hour := 0; hour < 24; hour++ {
+		if spec.Hour&(uint64(1)<<hour) != 0 && (hour < 5 || hour > 23) {
+			return fmt.Errorf("schedule hours must be within 05:00–23:59; nighttime automatic checks are disabled")
+		}
+	}
+	if spec.Hour&(uint64(1)<<23) != 0 && spec.Minute&(uint64(1)<<59) != 0 {
+		return fmt.Errorf("schedule at 23:59 would cross midnight after jitter")
+	}
+	return nil
 }
 
 func validJobName(name string) bool {

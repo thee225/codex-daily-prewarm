@@ -35,10 +35,7 @@ func newRuntimeScheduler(r *runtime) *runtimeScheduler {
 
 func (s *runtimeScheduler) stop() {
 	s.once.Do(func() { close(s.stopCh) })
-	select {
-	case <-s.doneCh:
-	case <-time.After(2 * time.Second):
-	}
+	<-s.doneCh
 }
 
 func slotKey(job string, base time.Time) string {

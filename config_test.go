@@ -19,7 +19,7 @@ func TestParsePluginConfigDefaults(t *testing.T) {
 }
 
 func TestParsePluginConfigCustom(t *testing.T) {
-	raw := []byte("enabled: true\nautomatic_enabled: true\nschedule: '10 4 * * *'\ntimezone: Asia/Shanghai\nmodel: gpt-5.4\nprompt: hello\nexpected_account_count: 4\naccount_spacing: 5s\nretry_count: 0\nstate_path: /tmp/prewarm.json\n")
+	raw := []byte("enabled: true\nautomatic_enabled: true\nschedule: '10 5 * * *'\ntimezone: Asia/Shanghai\nmodel: gpt-5.4\nprompt: hello\nexpected_account_count: 4\naccount_spacing: 5s\nretry_count: 0\nstate_path: /tmp/prewarm.json\n")
 	cfg, err := parsePluginConfig(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +27,7 @@ func TestParsePluginConfigCustom(t *testing.T) {
 	if !cfg.AutomaticEnabled || cfg.Model != "gpt-5.4" || cfg.Prompt != "hello" || cfg.ExpectedAccountCount != 4 || cfg.AccountSpacing != 5*time.Second || cfg.RetryCount != 0 {
 		t.Fatalf("unexpected config: %#v", cfg.public())
 	}
-	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 4, 9, 59, 0, cfg.Location)); got.Hour() != 4 || got.Minute() != 10 {
+	if got := cfg.CronSchedule.Next(time.Date(2026, 9, 21, 5, 9, 59, 0, cfg.Location)); got.Hour() != 5 || got.Minute() != 10 {
 		t.Fatalf("next run = %v", got)
 	}
 }
@@ -54,6 +54,14 @@ func TestParsePluginConfigRejectsUnsafeValues(t *testing.T) {
 		"mixed schedules": "schedule: '0 6 * * *'\njobs:\n  - name: noon\n    schedule: '0 12 * * *'",
 		"duplicate jobs":  "jobs:\n  - name: morning\n    schedule: '0 6 * * *'\n  - name: morning\n    schedule: '0 12 * * *'",
 		"invalid job":     "jobs:\n  - name: bad/job\n    schedule: '0 6 * * *'",
+		"night schedule":  "schedule: '10 4 * * *'",
+		"01 schedule":     "schedule: '0 1 * * *'",
+		"mixed night":     "schedule: '0 1,8 * * *'",
+		"night job":       "jobs:\n  - name: night\n    schedule: '0 1 * * *'",
+		"midnight jitter": "schedule: '59 23 * * *'",
+		"allowlist typo":  "warm_allow_list:\n  - acct-012345abcdef",
+		"job typo":        "jobs:\n  - name: day\n    schedule: '0 8 * * *'\n    modle: gpt-5.4",
+		"extra document":  "enabled: true\n---\nenabled: false",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parsePluginConfig([]byte(raw)); err == nil {
