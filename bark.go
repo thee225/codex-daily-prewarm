@@ -40,14 +40,20 @@ func sendScheduleBark(cfg pluginConfig, record runRecord) string {
 	})
 	raw, err := callHost(pluginabi.MethodHostHTTPDo, pluginapi.HTTPRequest{
 		Method: http.MethodPost, URL: cfg.BarkURL,
-		Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body,
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+			"User-Agent":   []string{"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36"},
+		}, Body: body,
 	})
 	if err != nil {
 		return "transport_failed"
 	}
 	var response pluginapi.HTTPResponse
-	if json.Unmarshal(raw, &response) != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "http_failed"
+	if json.Unmarshal(raw, &response) != nil {
+		return "invalid_response"
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Sprintf("http_%d", response.StatusCode)
 	}
 	var acknowledgement struct {
 		Code int `json:"code"`
