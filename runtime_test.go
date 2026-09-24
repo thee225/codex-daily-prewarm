@@ -203,6 +203,9 @@ func TestUpstreamUsageLimitDetails(t *testing.T) {
 	if got := upstreamErrorCode(message, http.StatusTooManyRequests); got != "usage_limit_reached" {
 		t.Fatalf("error code = %q", got)
 	}
+	if got := upstreamErrorCode(`{"type":"usage_limit_reached"}`, http.StatusTooManyRequests); got != "usage_limit_reached" {
+		t.Fatalf("top-level error code = %q", got)
+	}
 	if safeToRetryStatus(http.StatusTooManyRequests) {
 		t.Fatal("usage-limit 429 must not be retried")
 	}

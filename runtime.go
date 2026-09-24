@@ -710,11 +710,12 @@ func upstreamResetAt(message string, now time.Time) time.Time {
 func upstreamErrorCode(message string, status int) string {
 	if status == http.StatusTooManyRequests && len(message) <= 16<<10 && json.Valid([]byte(message)) {
 		var payload struct {
+			Type  string `json:"type"`
 			Error struct {
 				Type string `json:"type"`
 			} `json:"error"`
 		}
-		if json.Unmarshal([]byte(message), &payload) == nil && payload.Error.Type == "usage_limit_reached" {
+		if json.Unmarshal([]byte(message), &payload) == nil && (payload.Error.Type == "usage_limit_reached" || payload.Type == "usage_limit_reached") {
 			return "usage_limit_reached"
 		}
 	}
