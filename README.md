@@ -23,6 +23,7 @@ plugins:
       enabled: true
       automatic_enabled: true
       dry_run: true
+      warm_allowlist: []
       sync_on_first_use: true
       schedule: "0 5,10,15,20 * * *"
       timezone: "Asia/Shanghai"
@@ -38,6 +39,8 @@ plugins:
 ```
 
 `bark_url` 只能放在权限受限的生产 CPA 配置中，不能提交到 Git。状态页只显示是否配置。定时巡检结束后汇总发一条 Bark；北京时间 23:00 至次日 08:00 只记日志。业务事件不推送。`jobs` 可代替 `schedule` 配置多个检查点，每项可包含 `name`、`schedule`、`model`、`prompt`。
+
+灰度时将 `dry_run` 设为 `false`，并把一个状态页中的匿名账号指纹填入 `warm_allowlist`。插件仍查询全部账号，仅允许列表内的账号发模型请求。空列表表示允许所有符合条件的账号。
 
 ## 查看运行情况
 
@@ -56,5 +59,5 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.5.0
+make build GOOS=linux GOARCH=amd64 VERSION=0.5.1
 ```

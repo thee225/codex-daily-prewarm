@@ -25,6 +25,7 @@ type pluginConfig struct {
 	AutomaticEnabled     bool           `json:"automatic_enabled"`
 	DryRun               bool           `json:"dry_run"`
 	BarkURL              string         `json:"-"`
+	WarmAllowlist        []string       `json:"warm_allowlist,omitempty"`
 	SyncOnFirstUse       bool           `json:"sync_on_first_use"`
 	Schedule             string         `json:"schedule"`
 	Timezone             string         `json:"timezone"`
@@ -60,6 +61,7 @@ type yamlPluginConfig struct {
 	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
 	DryRun               *bool            `yaml:"dry_run"`
 	BarkURL              string           `yaml:"bark_url"`
+	WarmAllowlist        []string         `yaml:"warm_allowlist"`
 	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"`
 	Schedule             string           `yaml:"schedule"`
 	Timezone             string           `yaml:"timezone"`
@@ -117,6 +119,24 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			return cfg, fmt.Errorf("bark_url must be an HTTPS URL")
 		}
 		cfg.BarkURL = parsed.String()
+	}
+	if len(input.WarmAllowlist) > 0 {
+		if len(input.WarmAllowlist) > 100 {
+			return cfg, fmt.Errorf("warm_allowlist must contain at most 100 accounts")
+		}
+		seen := make(map[string]bool, len(input.WarmAllowlist))
+		for _, fingerprint := range input.WarmAllowlist {
+			if len(fingerprint) != 17 || !strings.HasPrefix(fingerprint, "acct-") || seen[fingerprint] {
+				return cfg, fmt.Errorf("warm_allowlist contains an invalid or duplicate fingerprint")
+			}
+			for _, ch := range fingerprint[5:] {
+				if !strings.ContainsRune("0123456789abcdef", ch) {
+					return cfg, fmt.Errorf("warm_allowlist contains an invalid fingerprint")
+				}
+			}
+			seen[fingerprint] = true
+		}
+		cfg.WarmAllowlist = append([]string(nil), input.WarmAllowlist...)
 	}
 	if input.SyncOnFirstUse != nil {
 		cfg.SyncOnFirstUse = *input.SyncOnFirstUse
@@ -264,6 +284,7 @@ type publicConfig struct {
 	AutomaticEnabled     bool        `json:"automatic_enabled"`
 	DryRun               bool        `json:"dry_run"`
 	BarkConfigured       bool        `json:"bark_configured"`
+	WarmAllowlist        []string    `json:"warm_allowlist,omitempty"`
 	SyncOnFirstUse       bool        `json:"sync_on_first_use"`
 	Schedule             string      `json:"schedule"`
 	Timezone             string      `json:"timezone"`
@@ -294,6 +315,7 @@ func (cfg pluginConfig) public() publicConfig {
 		AutomaticEnabled:     cfg.AutomaticEnabled,
 		DryRun:               cfg.DryRun,
 		BarkConfigured:       cfg.BarkURL != "",
+		WarmAllowlist:        append([]string(nil), cfg.WarmAllowlist...),
 		SyncOnFirstUse:       cfg.SyncOnFirstUse,
 		Schedule:             cfg.Schedule,
 		Timezone:             cfg.Timezone,

@@ -227,6 +227,7 @@ func pluginRegistration() registration {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "automatic_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每日定时预热；宿主保留字段 enabled 仅控制插件是否加载。"},
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只读查询并记录 would_warm，不发模型请求；默认开启。"},
+				{Name: "warm_allowlist", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的灰度账号匿名指纹列表；空列表允许所有符合条件的账号。"},
 				{Name: "bark_url", Type: pluginapi.ConfigFieldTypeString, Description: "定时巡检汇总的 Bark HTTPS 地址；23:00 至 08:00 免打扰。仅存入受限 CPA 配置，不出现在插件状态与日志。"},
 				{Name: "sync_on_first_use", Type: pluginapi.ConfigFieldTypeBoolean, Description: "账号首次进入新五小时窗口后合并巡检；可信额度 429 仅触发只读巡检。"},
 				{Name: "schedule", Type: pluginapi.ConfigFieldTypeString, Description: "标准五段 cron；默认北京时间 05、10、15、20 点检查。"},

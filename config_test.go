@@ -75,3 +75,18 @@ func TestParseMultipleJobs(t *testing.T) {
 		t.Fatalf("evening next = %s", got)
 	}
 }
+
+func TestWarmAllowlistValidation(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("warm_allowlist:\n  - acct-012345abcdef\n"))
+	if err != nil || len(cfg.WarmAllowlist) != 1 {
+		t.Fatalf("valid allowlist rejected: %v", err)
+	}
+	for _, raw := range []string{
+		"warm_allowlist: [acct-012345abcdef, acct-012345abcdef]",
+		"warm_allowlist: [acct-invalid]",
+	} {
+		if _, err := parsePluginConfig([]byte(raw)); err == nil {
+			t.Fatalf("invalid allowlist accepted: %s", raw)
+		}
+	}
+}

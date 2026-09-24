@@ -395,6 +395,18 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 				reason = limitReason
 			}
 		}
+		if reason == "" && len(cfg.WarmAllowlist) > 0 {
+			selected := false
+			for _, allowed := range cfg.WarmAllowlist {
+				if allowed == fingerprint {
+					selected = true
+					break
+				}
+			}
+			if !selected {
+				reason = "gray_not_selected"
+			}
+		}
 		if reason == "" && cfg.DryRun {
 			result.WouldWarm = true
 			result.SkipReason = "dry_run"
