@@ -34,8 +34,8 @@ func barkPushTarget(raw string) (string, string, error) {
 	return u.String(), key, nil
 }
 
-func sendScheduleBark(cfg pluginConfig, record runRecord) string {
-	return sendScheduleBarkWith(cfg, record, func(request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+func sendPrewarmSuccessBark(cfg pluginConfig, record runRecord) string {
+	return sendPrewarmSuccessBarkWith(cfg, record, func(request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 		raw, err := callHost(pluginabi.MethodHostHTTPDo, request)
 		if err != nil {
 			return pluginapi.HTTPResponse{}, err
@@ -48,7 +48,16 @@ func sendScheduleBark(cfg pluginConfig, record runRecord) string {
 	})
 }
 
-func sendScheduleBarkWith(cfg pluginConfig, record runRecord, send func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)) string {
+func sendPrewarmSuccessBarkWith(cfg pluginConfig, record runRecord, send func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)) string {
+	var successful []accountResult
+	for _, item := range record.Accounts {
+		if item.ResponseReceived {
+			successful = append(successful, item)
+		}
+	}
+	if len(successful) == 0 {
+		return "no_successful_prewarm"
+	}
 	if cfg.BarkURL == "" {
 		return "not_configured"
 	}
@@ -60,24 +69,17 @@ func sendScheduleBarkWith(cfg pluginConfig, record runRecord, send func(pluginap
 	if err != nil {
 		return "invalid_bark_url"
 	}
-	lines := []string{fmt.Sprintf("查询 %d/%d；预热 %d；待预热 %d；跳过 %d", record.QuotaQueried, record.Discovered, record.Attempted, record.WouldWarm, record.Skipped)}
-	for _, item := range record.Accounts {
+	lines := []string{fmt.Sprintf("预热成功 %d 个账号", len(successful))}
+	for _, item := range successful {
 		line := item.Account
 		if !item.QuotaCheckedAt.IsZero() {
 			line += fmt.Sprintf(" 5h %.0f%% 周 %.0f%%", 100-item.FiveHour.UsedPercent, 100-item.Weekly.UsedPercent)
-		}
-		if item.SkipReason != "" {
-			line += " " + item.SkipReason
-		} else if item.ResponseReceived {
-			line += " warm_ok"
-		} else if item.ErrorCode != "" {
-			line += " " + item.ErrorCode
 		}
 		lines = append(lines, line)
 	}
 	body, err := json.Marshal(map[string]string{
 		"device_key": deviceKey,
-		"title":      "Codex 额度巡检",
+		"title":      "Codex 预热成功",
 		"body":       strings.Join(lines, "\n"),
 		"group":      "codex-daily-prewarm",
 	})

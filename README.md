@@ -40,16 +40,16 @@ plugins:
       # bark_url: "https://你的 Bark 服务地址/设备密钥"
 ```
 
-`bark_url` 只能放在权限受限的生产 CPA 配置中，不能提交到 Git。插件从现有 `https://Bark服务/设备密钥` 配置中提取密钥，向同一服务的 `/push` 发送 JSON，正文中的 `%` 保持原样。管理状态只显示是否配置。定时巡检结束后汇总发一条 Bark；北京时间 23:00 至次日 08:00 只记日志。业务事件不推送。`jobs` 可代替 `schedule` 配置多个检查点，每项可包含 `name`、`schedule`、`model`、`prompt`。若前置 Worker 对已解析的 JSON 正文再次执行 URL 解码，仍需修复 Worker 才能正确处理 `%`。
+`bark_url` 只能放在权限受限的生产 CPA 配置中，不能提交到 Git。插件从现有 `https://Bark服务/设备密钥` 配置中提取密钥，向同一服务的 `/push` 发送 JSON，正文中的 `%` 保持原样。管理状态只显示是否配置。定时巡检、重置补查及主动要求通知的手动运行，仅在至少一个账号收到有效模型回复后汇总发送一条 Bark；查询、跳过、`dry_run`、`observe`、429 或全部失败时只写日志。北京时间 23:00 至次日 08:00 即使预热成功也只记日志，不补发。业务事件不推送。`jobs` 可代替 `schedule` 配置多个检查点，每项可包含 `name`、`schedule`、`model`、`prompt`。若前置 Worker 对已解析的 JSON 正文再次执行 URL 解码，仍需修复 Worker 才能正确处理 `%`。
 
 灰度时将 `dry_run` 设为 `false`，并把一个状态页中的匿名账号指纹填入 `warm_allowlist`。插件仍查询全部账号，仅允许列表内的账号发模型请求。空列表表示允许所有符合条件的账号。
 
 ## 查看运行情况
 
-- `GET /v0/resource/plugins/codex-daily-prewarm/status`：公开入口只提供中文页面壳和全局模型名；逐账号额度、补查与最近运行结果通过需认证的管理状态接口加载。面板选择“记住密钥”后，插件页从同源的 `cli-proxy-auth` 登录存储中读取密钥并自动显示详情；未选择时浏览器不持久化密钥，页面无法自动取得面板内存中的登录态，可点击“验证并查看详情”只读加载，输入仅用于本页、不保存。页面另有“一键预热”按钮，立刻查询全部账号，符合条件的账号马上发起轻量模型请求；其余账号记录跳过原因，不等待下一个定时点。手动与定时运行使用同一任务配置和 Bark 汇总规则，仅触发来源不同。按钮调用始终需要 CPA 管理认证。
+- `GET /v0/resource/plugins/codex-daily-prewarm/status`：公开入口只提供中文页面壳和全局模型名；逐账号额度、补查与最近运行结果通过需认证的管理状态接口加载。面板选择“记住密钥”后，插件页从同源的 `cli-proxy-auth` 登录存储中读取密钥并自动显示详情；未选择时浏览器不持久化密钥，页面无法自动取得面板内存中的登录态，可点击“验证并查看详情”只读加载，输入仅用于本页、不保存。页面另有“一键预热”按钮，立刻查询全部账号额度并按现有条件尝试预热；只有实际成功才发 Bark。按钮调用始终需要 CPA 管理认证。
 - `GET /v0/management/plugins/codex-daily-prewarm/status`：状态 JSON，包含匿名账号的额度和滚动调用记录。
 - `GET /v0/management/plugins/codex-daily-prewarm/history`：最近 30 次巡检。
-- `POST /v0/management/plugins/codex-daily-prewarm/run-now`：手动发起一轮，仍受额度证据、dry-run 与次数保护；传入 `{"notify":true}` 可验证 Bark 汇总。
+- `POST /v0/management/plugins/codex-daily-prewarm/run-now`：手动发起一轮，仍受额度证据、dry-run 与次数保护；传入 `{"notify":true}` 也只在至少一个账号预热成功时发送 Bark。
 
 兼容旧调用中的 `force` 参数，但它不越过额度证据、五小时冷却、滚动次数和 dry-run 保护。
 
@@ -61,5 +61,5 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.6.6
+make build GOOS=linux GOARCH=amd64 VERSION=0.6.7
 ```

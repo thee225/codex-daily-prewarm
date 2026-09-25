@@ -22,7 +22,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "读取插件状态与最近一次执行结果。"},
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/history", Description: "读取最近 30 次匿名化执行历史。"},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；可传 {\"notify\":true} 验证 Bark；安全门槛始终生效。"},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；传 {\"notify\":true} 时仅在实际预热成功后发送 Bark；安全门槛始终生效。"},
 		},
 	}
 }

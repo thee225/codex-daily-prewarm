@@ -394,8 +394,8 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)
 		record.Success = record.ErrorCode == "" && record.Succeeded+record.Skipped == record.Discovered && record.Discovered > 0
-		if request.Trigger == "schedule" || request.Notify {
-			record.BarkStatus = sendScheduleBark(cfg, record)
+		if request.Trigger == "schedule" || request.Trigger == "reset_followup" || request.Notify {
+			record.BarkStatus = sendPrewarmSuccessBark(cfg, record)
 		}
 		r.appendRun(cfg, record)
 	}()

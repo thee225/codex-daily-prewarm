@@ -227,7 +227,7 @@ func pluginRegistration() registration {
 				{Name: "automatic_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每日定时预热；宿主保留字段 enabled 仅控制插件是否加载。"},
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只读查询并记录 would_warm，不发模型请求；默认开启。"},
 				{Name: "warm_allowlist", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的灰度账号匿名指纹列表；空列表允许所有符合条件的账号。"},
-				{Name: "bark_url", Type: pluginapi.ConfigFieldTypeString, Description: "定时巡检汇总的 Bark HTTPS 地址；23:00 至 08:00 免打扰。仅存入受限 CPA 配置，不出现在插件状态与日志。"},
+				{Name: "bark_url", Type: pluginapi.ConfigFieldTypeString, Description: "实际预热成功后发送一条 Bark 的 HTTPS 地址；23:00 至 08:00 免打扰。仅存入受限 CPA 配置，不出现在插件状态与日志。"},
 				{Name: "reset_followup_mode", Type: pluginapi.ConfigFieldTypeString, Description: "重置补查模式：off、observe（只读观察，默认）或 active（符合条件后预热）。"},
 				{Name: "schedule", Type: pluginapi.ConfigFieldTypeString, Description: "标准五段 cron；默认北京时间 05 至 23 点每小时巡检，整轮随机延迟 10–60 秒。"},
 				{Name: "jobs", Type: pluginapi.ConfigFieldTypeArray, Description: "可选的多时间段任务列表；每项含 name、schedule，可选 model 和 prompt。与 schedule 二选一。"},
