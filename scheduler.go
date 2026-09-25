@@ -83,6 +83,7 @@ func (s *runtimeScheduler) planSlot(job prewarmJob, base, now time.Time) {
 	r := s.runtime
 	r.mu.RLock()
 	location := r.cfg.Location
+	statePath := r.cfg.StatePath
 	r.mu.RUnlock()
 	if base.IsZero() || !inScheduleHour(base, location) {
 		return
@@ -110,7 +111,7 @@ func (s *runtimeScheduler) planSlot(job prewarmJob, base, now time.Time) {
 		}
 	}
 	r.mu.Unlock()
-	if err := r.persistState(r.cfg.StatePath); err != nil {
+	if err := r.persistState(statePath); err != nil {
 		r.mu.Lock()
 		if slot, exists := r.state.Slots[key]; exists && slot.StartedAt.IsZero() && slot.JitterSeconds == jitter {
 			delete(r.state.Slots, key)
@@ -238,6 +239,7 @@ func (s *runtimeScheduler) processDue(now time.Time) {
 			logHost("info", "codex prewarm followup due", map[string]any{"account": request.TargetAccount, "kind": request.FollowupKind, "due_at": request.DueAt})
 		}
 		if err := r.startRunJob(request); err != nil {
+			r.requeueInterrupted(request)
 			r.setLastError(safeErrorCode(err))
 			logHost("error", "codex prewarm scheduled run rejected", map[string]any{"trigger": request.Trigger, "error_code": safeErrorCode(err)})
 		}

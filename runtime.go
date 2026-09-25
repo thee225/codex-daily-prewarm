@@ -160,6 +160,7 @@ type runtime struct {
 	cron           *cron.Cron
 	scheduler      *runtimeScheduler
 	currentRequest runRequest
+	stopCh         chan struct{}
 	state          runtimeState
 	running        bool
 	pending        []runRequest
@@ -196,7 +197,7 @@ type hostLogRequest struct {
 
 func newRuntime() *runtime {
 	cfg := defaultPluginConfig()
-	return &runtime{cfg: cfg, state: newState(), generation: 1}
+	return &runtime{cfg: cfg, state: newState(), generation: 1, stopCh: make(chan struct{})}
 }
 
 func newState() runtimeState {
@@ -213,8 +214,29 @@ func (r *runtime) configure(raw []byte) error {
 	if r.terminal {
 		return errors.New("plugin has been shut down")
 	}
+	r.mu.RLock()
+	oldPath := r.cfg.StatePath
+	hadState := len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0
+	r.mu.RUnlock()
+	// Validate a different target before stopping the healthy old scheduler.
+	// The authoritative snapshot is still read after quiesce drains old runs.
+	if cfg.StatePath != oldPath {
+		if _, err := readState(cfg.StatePath); err != nil && (!errors.Is(err, os.ErrNotExist) || hadState) {
+			if _, oldErr := readState(oldPath); oldErr == nil || errors.Is(oldErr, os.ErrNotExist) {
+				return fmt.Errorf("load state: %w", err)
+			}
+			r.quiesce() // The old state is also unreadable: fail closed.
+			return fmt.Errorf("load state: %w", err)
+		}
+	}
 	r.quiesce()
+	r.mu.RLock()
+	hadState = len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0
+	r.mu.RUnlock()
 	state, stateErr := readState(cfg.StatePath)
+	if errors.Is(stateErr, os.ErrNotExist) && hadState {
+		return fmt.Errorf("load state: missing state file would discard existing account history")
+	}
 	if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
 		return fmt.Errorf("load state: %w", stateErr)
 	}
@@ -222,6 +244,7 @@ func (r *runtime) configure(raw []byte) error {
 	r.cfg = cfg
 	r.state = state
 	r.closed = false
+	r.stopCh = make(chan struct{})
 	r.lastError = ""
 	r.mu.Unlock()
 	if cfg.AutomaticEnabled {
@@ -262,8 +285,12 @@ func (r *runtime) quiesceOnly() {
 // every accepted run before state can be reloaded or the host API unloaded.
 func (r *runtime) quiesce() {
 	r.mu.Lock()
+	if !r.closed && r.stopCh != nil {
+		close(r.stopCh)
+	}
 	r.closed = true
 	r.generation++
+	pending := append([]runRequest(nil), r.pending...)
 	r.pending = nil
 	c := r.cron
 	scheduler := r.scheduler
@@ -277,6 +304,75 @@ func (r *runtime) quiesce() {
 		scheduler.stop()
 	}
 	r.runWG.Wait()
+	for _, request := range pending {
+		r.requeueInterrupted(request)
+	}
+}
+
+func runStopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitForRun(stop <-chan struct{}, duration time.Duration) bool {
+	if runStopped(stop) {
+		return false
+	}
+	if duration <= 0 {
+		return true
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return !runStopped(stop)
+	}
+}
+
+// A stopped run may have claimed a durable slot or follow-up before it began.
+// Put it back; reservations already persisted for completed model calls still
+// prevent a duplicate prewarm when the new scheduler picks it up.
+func (r *runtime) requeueInterrupted(request runRequest) {
+	r.mu.Lock()
+	changed := false
+	switch request.Trigger {
+	case "schedule":
+		if slot, exists := r.state.Slots[request.Slot]; exists && !slot.StartedAt.IsZero() {
+			slot.StartedAt = time.Time{}
+			r.state.Slots[request.Slot] = slot
+			changed = true
+		}
+	case "reset_followup":
+		if request.TargetAccount != "" && !request.DueAt.IsZero() {
+			window := r.state.Accounts[request.TargetAccount]
+			for _, kind := range strings.Split(request.FollowupKind, "+") {
+				switch kind {
+				case "five_hour":
+					window.FiveHourFollowupAt = request.DueAt
+				case "weekly":
+					window.WeeklyFollowupAt = request.DueAt
+				case "retry":
+					window.QuotaRetryAt = request.DueAt
+				}
+			}
+			r.state.Accounts[request.TargetAccount] = window
+			changed = true
+		}
+	}
+	path := r.cfg.StatePath
+	r.mu.Unlock()
+	if changed {
+		if err := r.persistState(path); err != nil {
+			r.setLastError("interrupted_requeue_write_failed")
+			logHost("error", "codex prewarm interrupted run requeue failed", map[string]any{"error_code": "interrupted_requeue_write_failed"})
+		}
+	}
 }
 
 var errAlreadyRunning = errors.New("prewarm is already running")
@@ -371,6 +467,9 @@ func (r *runtime) runQueue(request runRequest) {
 }
 
 func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
+	r.mu.RLock()
+	stop := r.stopCh
+	r.mu.RUnlock()
 	now := time.Now().In(cfg.Location)
 	record := runRecord{
 		ID:            fmt.Sprintf("%d", now.UnixNano()),
@@ -394,11 +493,18 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)
 		record.Success = record.ErrorCode == "" && record.Succeeded+record.Skipped == record.Discovered && record.Discovered > 0
+		if record.ErrorCode == "interrupted" {
+			r.requeueInterrupted(request)
+		}
 		if request.Trigger == "schedule" || request.Trigger == "reset_followup" || request.Notify {
 			record.BarkStatus = sendPrewarmSuccessBark(cfg, record)
 		}
 		r.appendRun(cfg, record)
 	}()
+	if runStopped(stop) {
+		record.ErrorCode = "interrupted"
+		return record
+	}
 
 	auths, err := listCodexAuths()
 	if err != nil {
@@ -429,9 +535,18 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		}
 	}
 	record.Discovered = len(auths)
-	firstResults := fetchInitialUsages(auths, fetchUsage)
+	firstResults := fetchInitialUsagesUntil(auths, stop, fetchUsage)
+	if runStopped(stop) {
+		record.ErrorCode = "interrupted"
+		return record
+	}
 
+	var lastModelFinishedAt time.Time
 	for index, auth := range auths {
+		if runStopped(stop) {
+			record.ErrorCode = "interrupted"
+			return record
+		}
 		fingerprint := accountFingerprint(auth.ID)
 		result := accountResult{Account: fingerprint, AccountType: safeAccountType(auth.AccountType), Model: request.Job.Model, StartedAt: time.Now().In(cfg.Location)}
 		first, reason := firstResults[index].observation, firstResults[index].reason
@@ -453,13 +568,8 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 				r.clearQuotaRetry(cfg, fingerprint)
 			}
 			if reason == "" {
-				if first.Weekly.UsedPercent >= 95 {
-					reason = "weekly_below_threshold"
-				} else if !first.Allowed {
-					reason = "upstream_disallowed"
-				} else if first.FiveHour.UsedPercent != 0 {
-					reason = "active_five_hour_window"
-				} else {
+				reason = quotaCandidateReason(first)
+				if reason == "" {
 					if limitReason := r.warmLimitReason(fingerprint, time.Now()); limitReason != "" {
 						reason = limitReason
 					}
@@ -476,22 +586,25 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 						}
 					}
 					if reason == "" {
-						time.Sleep(3 * time.Second)
-						second, secondReason := fetchUsage(auth)
-						if secondReason != "" {
-							reason = "idle_confirmation_" + secondReason
+						var spacing time.Duration
+						if !lastModelFinishedAt.IsZero() {
+							spacing = cfg.AccountSpacing - time.Since(lastModelFinishedAt)
+						}
+						confirmed, confirmReason := confirmIdleAfterSpacing(first, spacing, stop, waitForRun,
+							func() (quotaObservation, string) { return fetchUsage(auth) },
+							func(observation quotaObservation) bool { return r.saveQuota(cfg, fingerprint, observation) },
+						)
+						result.QuotaCheckedAt, result.FiveHour, result.Weekly = confirmed.CheckedAt, confirmed.FiveHour, confirmed.Weekly
+						reason = confirmReason
+						if strings.HasPrefix(reason, "idle_confirmation_") {
 							result.QuotaStatus = "query_failed"
 							r.saveQuotaFailure(cfg, fingerprint, reason)
 							if request.TargetAccount != "" {
-								r.scheduleQuotaRetry(cfg, fingerprint, time.Now(), secondReason)
+								r.scheduleQuotaRetry(cfg, fingerprint, time.Now(), strings.TrimPrefix(reason, "idle_confirmation_"))
 							}
-						} else {
-							result.QuotaCheckedAt, result.FiveHour, result.Weekly = second.CheckedAt, second.FiveHour, second.Weekly
-							if !r.saveQuota(cfg, fingerprint, second) {
-								reason = "state_write_failed"
-							} else if !confirmedIdle(first, second) {
-								reason = "five_hour_not_confirmed_idle"
-							}
+						}
+						if reason == "" {
+							reason = r.warmLimitReason(fingerprint, time.Now())
 						}
 					}
 				}
@@ -499,6 +612,10 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		}
 		if request.TargetAccount != "" && result.QuotaStatus != "query_failed" {
 			r.clearQuotaRetry(cfg, fingerprint)
+		}
+		if reason == "interrupted" {
+			record.ErrorCode = "interrupted"
+			return record
 		}
 		if reason == "" && request.ObserveOnly {
 			result.WouldWarm = true
@@ -526,10 +643,11 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 			})
 			continue
 		}
-		if record.Attempted > 0 && cfg.AccountSpacing > 0 {
-			time.Sleep(cfg.AccountSpacing)
+		if runStopped(stop) {
+			record.ErrorCode = "interrupted"
+			return record
 		}
-		modelResult := executeAccountWithGuard(cfg, request.Job, auth, func() bool {
+		modelResult := executeAccountWithGuard(cfg, request.Job, auth, stop, func() bool {
 			return r.reserveAttempt(cfg, fingerprint, time.Now())
 		})
 		result.Attempts = modelResult.Attempts
@@ -539,9 +657,12 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		result.ErrorCode = modelResult.ErrorCode
 		result.FinishedAt = modelResult.FinishedAt
 		result.Attempts24h = r.attemptCount(fingerprint, time.Now())
-		record.Attempted++
+		if result.Attempts > 0 {
+			record.Attempted++
+			lastModelFinishedAt = modelResult.FinishedAt
+			r.recordAccountResult(cfg, fingerprint, result)
+		}
 		record.Accounts = append(record.Accounts, result)
-		r.recordAccountResult(cfg, fingerprint, result)
 		if result.ResponseReceived {
 			record.Succeeded++
 		}
@@ -549,6 +670,10 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 			"account": fingerprint, "status": result.StatusCode, "response_received": result.ResponseReceived,
 			"error_code": result.ErrorCode, "position": index + 1, "total": len(auths),
 		})
+		if modelResult.ErrorCode == "interrupted" {
+			record.ErrorCode = "interrupted"
+			return record
+		}
 	}
 	if record.Succeeded+record.Skipped != record.Discovered {
 		record.ErrorCode = "one_or_more_accounts_failed"
@@ -619,10 +744,10 @@ func eligibleCodexAuths(files []pluginapi.HostAuthFileEntry) []pluginapi.HostAut
 }
 
 func executeAccount(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry) accountResult {
-	return executeAccountWithGuard(cfg, job, auth, func() bool { return true })
+	return executeAccountWithGuard(cfg, job, auth, nil, func() bool { return true })
 }
 
-func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry, reserve func() bool) accountResult {
+func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.HostAuthFileEntry, stop <-chan struct{}, reserve func() bool) accountResult {
 	result := accountResult{
 		Account:     accountFingerprint(auth.ID),
 		AccountType: safeAccountType(auth.AccountType),
@@ -634,6 +759,10 @@ func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.Ho
 		models = append(models, cfg.FallbackModel)
 	}
 	for modelIndex, model := range models {
+		if runStopped(stop) {
+			result.ErrorCode = "interrupted"
+			break
+		}
 		result.Model = model
 		result.FallbackUsed = modelIndex > 0
 		body, err := json.Marshal(chatCompletionRequest{
@@ -645,11 +774,20 @@ func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.Ho
 		}
 		unsupported := false
 		for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
+			if runStopped(stop) {
+				result.ErrorCode = "interrupted"
+				break
+			}
 			if !reserve() {
 				result.ErrorCode = "attempt_limit_or_state_write_failed"
 				break
 			}
 			result.Attempts++
+			if runStopped(stop) {
+				// A persisted reservation is kept even if shutdown wins this race.
+				result.ErrorCode = "interrupted"
+				break
+			}
 			raw, callErr := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
 				HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 					EntryProtocol: "openai", ExitProtocol: "openai", Model: model,
@@ -667,7 +805,10 @@ func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.Ho
 					if unsupported || attempt >= cfg.RetryCount || !safeToRetryStatus(hostErr.HTTPStatus) {
 						break
 					}
-					time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+					if !waitForRun(stop, time.Duration(attempt+1)*2*time.Second) {
+						result.ErrorCode = "interrupted"
+						break
+					}
 					continue
 				}
 				// An uncertain callback may have consumed quota: never retry or fall back.
@@ -696,9 +837,12 @@ func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.Ho
 			if unsupported || attempt >= cfg.RetryCount || !safeToRetryStatus(response.StatusCode) {
 				break
 			}
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			if !waitForRun(stop, time.Duration(attempt+1)*2*time.Second) {
+				result.ErrorCode = "interrupted"
+				break
+			}
 		}
-		if result.ResponseReceived || !unsupported {
+		if result.ResponseReceived || !unsupported || result.ErrorCode == "interrupted" {
 			break
 		}
 	}

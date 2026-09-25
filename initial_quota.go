@@ -12,6 +12,10 @@ type firstQuota struct {
 }
 
 func fetchInitialUsages(auths []pluginapi.HostAuthFileEntry, fetch func(pluginapi.HostAuthFileEntry) (quotaObservation, string)) []firstQuota {
+	return fetchInitialUsagesUntil(auths, nil, fetch)
+}
+
+func fetchInitialUsagesUntil(auths []pluginapi.HostAuthFileEntry, stop <-chan struct{}, fetch func(pluginapi.HostAuthFileEntry) (quotaObservation, string)) []firstQuota {
 	results := make([]firstQuota, len(auths))
 	sem := make(chan struct{}, 3)
 	var fetches sync.WaitGroup
@@ -19,8 +23,17 @@ func fetchInitialUsages(auths []pluginapi.HostAuthFileEntry, fetch func(pluginap
 		fetches.Add(1)
 		go func(index int, auth pluginapi.HostAuthFileEntry) {
 			defer fetches.Done()
-			sem <- struct{}{}
+			select {
+			case <-stop:
+				results[index].reason = "interrupted"
+				return
+			case sem <- struct{}{}:
+			}
 			defer func() { <-sem }()
+			if runStopped(stop) {
+				results[index].reason = "interrupted"
+				return
+			}
 			results[index].observation, results[index].reason = fetch(auth)
 		}(index, auth)
 	}

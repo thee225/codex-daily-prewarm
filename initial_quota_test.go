@@ -54,3 +54,41 @@ func TestInitialQuotaQueriesRunAtMostThreeConcurrently(t *testing.T) {
 		t.Fatal("quota query round did not finish")
 	}
 }
+
+func TestStoppingInitialQuotaQueriesDoesNotStartQueuedAccounts(t *testing.T) {
+	auths := []pluginapi.HostAuthFileEntry{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}, {ID: "e"}}
+	stop := make(chan struct{})
+	started := make(chan struct{}, len(auths))
+	release := make(chan struct{})
+	finished := make(chan []firstQuota, 1)
+	go func() {
+		finished <- fetchInitialUsagesUntil(auths, stop, func(pluginapi.HostAuthFileEntry) (quotaObservation, string) {
+			started <- struct{}{}
+			<-release
+			return quotaObservation{}, ""
+		})
+	}()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("initial quota workers did not start")
+		}
+	}
+	close(stop)
+	close(release)
+	select {
+	case results := <-finished:
+		interrupted := 0
+		for _, result := range results {
+			if result.reason == "interrupted" {
+				interrupted++
+			}
+		}
+		if interrupted != 2 || len(started) != 0 {
+			t.Fatalf("stop started queued work: interrupted=%d extra_started=%d", interrupted, len(started))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial quota workers did not stop")
+	}
+}
