@@ -157,10 +157,13 @@ func renderStatusPage(status runtimeStatus) string {
 	if status.LastRun != nil {
 		for _, item := range status.LastRun.Accounts {
 			quota := "未知"
-			if !item.QuotaCheckedAt.IsZero() {
+			if item.QuotaStatus == "confirmed" && !item.QuotaCheckedAt.IsZero() && item.FiveHour.WindowMinutes == fiveHourMinutes && item.Weekly.WindowMinutes == weeklyMinutes && !item.FiveHour.ResetAt.IsZero() && !item.Weekly.ResetAt.IsZero() {
 				quota = fmt.Sprintf("%.0f%% / %.0f%%", 100-item.FiveHour.UsedPercent, 100-item.Weekly.UsedPercent)
 			}
 			reason := item.SkipReason
+			if reason == "" {
+				reason = item.ErrorCode
+			}
 			if reason == "followup_observe" {
 				reason = "观察模式：符合预热条件，未发模型请求"
 			}
@@ -241,8 +244,9 @@ const statusPageActionScript = `<script>
         'dry-run：' + (state.config.dry_run ? '开启' : '关闭'),
         '重置补查：' + state.config.reset_followup_mode,
         '当前：' + (state.running ? '运行中' : '空闲'),
+        '运行错误：' + (state.last_error || '无'),
         '下次运行：' + (formatTime(state.next_run_at, state.config.timezone) || '未计划'),
-        '最近运行：' + (last ? [formatTime(last.finished_at, state.config.timezone), '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '跳过 ' + last.skipped_accounts, 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
+        '最近运行：' + (last ? [formatTime(last.finished_at, state.config.timezone), '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '预热成功 ' + last.succeeded_accounts, '跳过 ' + last.skipped_accounts, '失败 ' + (last.failed_accounts ?? 0), '错误 ' + (last.error_code || '无'), 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
         '', '待执行账号补查：'
       ];
       for (const [account, window] of Object.entries(state.accounts || {}).sort()) {
@@ -253,7 +257,8 @@ const statusPageActionScript = `<script>
       }
       lines.push('', '最近逐账号检查：');
       for (const item of (last?.accounts || [])) {
-        const quota = item.quota_checked_at ? '5h ' + (100 - (item.five_hour?.used_percent ?? 0)).toFixed(0) + '% / 周 ' + (100 - (item.weekly?.used_percent ?? 0)).toFixed(0) + '%' : '额度未知';
+        const known = item.quota_status === 'confirmed' && !!formatTime(item.quota_checked_at, state.config.timezone) && item.five_hour?.window_minutes === 300 && item.weekly?.window_minutes === 10080 && !!formatTime(item.five_hour.reset_at, state.config.timezone) && !!formatTime(item.weekly.reset_at, state.config.timezone);
+        const quota = known ? '5h ' + (100 - (item.five_hour?.used_percent ?? 0)).toFixed(0) + '% / 周 ' + (100 - (item.weekly?.used_percent ?? 0)).toFixed(0) + '%' : '额度未知';
         lines.push([item.account, quota, item.skip_reason || item.error_code || (item.response_received ? '预热成功' : '无结果'), '24h 调用 ' + item.attempts_24h].join(' · '));
       }
       details.textContent = lines.join('\n');

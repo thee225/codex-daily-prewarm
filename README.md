@@ -55,6 +55,8 @@ plugins:
 
 兼容旧调用中的 `force` 参数，但它不越过额度证据、五小时冷却、滚动次数和 dry-run 保护。
 
+从 v0.6.10 起，`would_warm_accounts` 表示通过额度、灰度及冷却门槛的账号数，真实、dry-run 和 observe 模式使用同一口径。`skipped_accounts` 只统计策略跳过，`failed_accounts` 统计查询或执行失败；查询失败、状态写入失败会使整轮 `success=false`，页面显示错误及“额度未知”。历史旧记录保留原值，不追溯重算。模型调用记录保留 `quota_before` 作为调用前证据，响应提供的新额度、重置时间及实际备用模型写入调用结果；响应没有额度时继续保留最近可信观测。
+
 持久状态为 `state_path`；同目录的 `codex-daily-prewarm.events.jsonl` 记录 `run_started` 与 `run_finished`，后者包含逐账号查询结果、跳过原因、预热调用数和 Bark 接收状态。文件权限均为 `0600`。生产 audit 文件由 infra 的 logrotate 管理；写失败会留下脱敏宿主日志。
 
 ## 构建
@@ -63,5 +65,7 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.6.9
+make build GOOS=linux GOARCH=amd64 VERSION=0.6.10
 ```
+
+页面状态回归检查（需要 Node.js）：`node tests/status-page.mjs`。Go 整轮执行测试使用模拟宿主，不访问生产服务、不消耗模型额度。

@@ -246,7 +246,10 @@ func pluginRegistration() registration {
 	}
 }
 
-func callHost(method string, payload any) (json.RawMessage, error) {
+// Tests replace this transport before starting workers and restore it after they drain.
+var callHost = callNativeHost
+
+func callNativeHost(method string, payload any) (json.RawMessage, error) {
 	if C.host_api_available() == 0 {
 		return nil, fmt.Errorf("CPA host callback API is unavailable")
 	}

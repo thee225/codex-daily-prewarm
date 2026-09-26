@@ -82,6 +82,7 @@ type runRecord struct {
 	BarkStatus         string          `json:"bark_status,omitempty"`
 	Succeeded          int             `json:"succeeded_accounts"`
 	Skipped            int             `json:"skipped_accounts"`
+	Failed             int             `json:"failed_accounts"`
 	ObservedResetCount int             `json:"observed_reset_accounts"`
 	ResetSpreadSeconds *int64          `json:"reset_spread_seconds,omitempty"`
 	Success            bool            `json:"success"`
@@ -90,25 +91,26 @@ type runRecord struct {
 }
 
 type accountResult struct {
-	Account          string      `json:"account"`
-	AccountType      string      `json:"account_type,omitempty"`
-	Model            string      `json:"model"`
-	StartedAt        time.Time   `json:"started_at"`
-	FinishedAt       time.Time   `json:"finished_at"`
-	Attempts         int         `json:"attempts"`
-	QuotaCheckedAt   time.Time   `json:"quota_checked_at,omitempty"`
-	QuotaStatus      string      `json:"quota_status,omitempty"`
-	Attempts24h      int         `json:"attempts_24h"`
-	WouldWarm        bool        `json:"would_warm,omitempty"`
-	StatusCode       int         `json:"status_code,omitempty"`
-	ResponseReceived bool        `json:"response_received"`
-	FallbackUsed     bool        `json:"fallback_used,omitempty"`
-	SkipReason       string      `json:"skip_reason,omitempty"`
-	PrimaryResetAt   time.Time   `json:"primary_reset_at,omitempty"`
-	PrimaryUsed      string      `json:"primary_used_percent,omitempty"`
-	FiveHour         quotaWindow `json:"five_hour,omitempty"`
-	Weekly           quotaWindow `json:"weekly,omitempty"`
-	ErrorCode        string      `json:"error_code,omitempty"`
+	QuotaBefore      *quotaObservation `json:"quota_before,omitempty"` // Evidence used to admit the model call.
+	Account          string            `json:"account"`
+	AccountType      string            `json:"account_type,omitempty"`
+	Model            string            `json:"model"`
+	StartedAt        time.Time         `json:"started_at"`
+	FinishedAt       time.Time         `json:"finished_at"`
+	Attempts         int               `json:"attempts"`
+	QuotaCheckedAt   time.Time         `json:"quota_checked_at,omitempty"`
+	QuotaStatus      string            `json:"quota_status,omitempty"`
+	Attempts24h      int               `json:"attempts_24h"`
+	WouldWarm        bool              `json:"would_warm,omitempty"`
+	StatusCode       int               `json:"status_code,omitempty"`
+	ResponseReceived bool              `json:"response_received"`
+	FallbackUsed     bool              `json:"fallback_used,omitempty"`
+	SkipReason       string            `json:"skip_reason,omitempty"`
+	PrimaryResetAt   time.Time         `json:"primary_reset_at,omitempty"`
+	PrimaryUsed      string            `json:"primary_used_percent,omitempty"`
+	FiveHour         quotaWindow       `json:"five_hour,omitempty"`
+	Weekly           quotaWindow       `json:"weekly,omitempty"`
+	ErrorCode        string            `json:"error_code,omitempty"`
 }
 
 type runtimeStatus struct {
@@ -150,23 +152,24 @@ type runRequest struct {
 }
 
 type runtime struct {
-	lifecycleMu    sync.Mutex
-	terminal       bool // guarded by lifecycleMu; native shutdown cannot be reopened
-	mu             sync.RWMutex
-	runWG          sync.WaitGroup
-	generation     uint64
-	persistMu      sync.Mutex
-	cfg            pluginConfig
-	cron           *cron.Cron
-	scheduler      *runtimeScheduler
-	currentRequest runRequest
-	stopCh         chan struct{}
-	state          runtimeState
-	running        bool
-	pending        []runRequest
-	closed         bool
-	lastError      string
-	runTask        func(pluginConfig, runRequest) runRecord // test seam; nil uses executeRun
+	lifecycleMu        sync.Mutex
+	terminal           bool // guarded by lifecycleMu; native shutdown cannot be reopened
+	mu                 sync.RWMutex
+	runWG              sync.WaitGroup
+	generation         uint64
+	persistMu          sync.Mutex
+	stateWriteFailures uint64 // guarded by mu; never reset during a run
+	cfg                pluginConfig
+	cron               *cron.Cron
+	scheduler          *runtimeScheduler
+	currentRequest     runRequest
+	stopCh             chan struct{}
+	state              runtimeState
+	running            bool
+	pending            []runRequest
+	closed             bool
+	lastError          string
+	runTask            func(pluginConfig, runRequest) runRecord // test seam; nil uses executeRun
 }
 
 type authListResponse struct {
@@ -466,12 +469,13 @@ func (r *runtime) runQueue(request runRequest) {
 	}
 }
 
-func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
+func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRecord) {
 	r.mu.RLock()
 	stop := r.stopCh
+	initialWriteFailures := r.stateWriteFailures
 	r.mu.RUnlock()
 	now := time.Now().In(cfg.Location)
-	record := runRecord{
+	record = runRecord{
 		ID:            fmt.Sprintf("%d", now.UnixNano()),
 		Job:           request.Job.Name,
 		Trigger:       request.Trigger,
@@ -492,6 +496,12 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 	}
 	defer func() {
 		record.FinishedAt = time.Now().In(cfg.Location)
+		r.mu.RLock()
+		writeFailed := r.stateWriteFailures != initialWriteFailures
+		r.mu.RUnlock()
+		if writeFailed && record.ErrorCode != "interrupted" {
+			record.ErrorCode = "state_write_failed"
+		}
 		record.Success = record.ErrorCode == "" && record.Succeeded+record.Skipped == record.Discovered && record.Discovered > 0
 		if record.ErrorCode == "interrupted" {
 			r.requeueInterrupted(request)
@@ -499,7 +509,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		if request.Trigger == "schedule" || request.Trigger == "reset_followup" || request.Notify {
 			record.BarkStatus = sendPrewarmSuccessBark(cfg, record)
 		}
-		r.appendRun(cfg, record)
+		record = r.appendRun(cfg, record)
 	}()
 	if runStopped(stop) {
 		record.ErrorCode = "interrupted"
@@ -617,25 +627,29 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 			record.ErrorCode = "interrupted"
 			return record
 		}
-		if reason == "" && request.ObserveOnly {
+		if reason == "" {
 			result.WouldWarm = true
 			record.WouldWarm++
+		}
+		if reason == "" && request.ObserveOnly {
 			reason = "followup_observe"
 		}
 		if reason == "" && cfg.DryRun {
-			result.WouldWarm = true
-			result.SkipReason = "dry_run"
-			record.WouldWarm++
 			reason = "dry_run"
 		}
 		if reason != "" {
-			result.SkipReason = reason
+			if result.QuotaStatus == "query_failed" || reason == "state_write_failed" {
+				result.ErrorCode = reason
+				record.Failed++
+			} else {
+				result.SkipReason = reason
+				record.Skipped++
+			}
 			result.FinishedAt = time.Now().In(cfg.Location)
 			result.Attempts24h = r.attemptCount(fingerprint, time.Now())
-			record.Skipped++
 			record.Accounts = append(record.Accounts, result)
 			window := r.accountWindow(fingerprint)
-			logHost("info", "codex prewarm account skipped", map[string]any{
+			logHost("info", "codex prewarm account checked", map[string]any{
 				"account": fingerprint, "trigger": request.Trigger, "reason": reason,
 				"five_hour_used_percent": result.FiveHour.UsedPercent, "weekly_used_percent": result.Weekly.UsedPercent,
 				"next_five_hour_check_at": window.FiveHourFollowupAt, "next_weekly_check_at": window.WeeklyFollowupAt,
@@ -650,6 +664,22 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		modelResult := executeAccountWithGuard(cfg, request.Job, auth, stop, func() bool {
 			return r.reserveAttempt(cfg, fingerprint, time.Now())
 		})
+		if modelResult.Attempts > 0 {
+			result.QuotaBefore = &quotaObservation{CheckedAt: result.QuotaCheckedAt, FiveHour: result.FiveHour, Weekly: result.Weekly, Allowed: true, Status: result.QuotaStatus}
+		}
+		result.Model = modelResult.Model
+		result.PrimaryResetAt = modelResult.PrimaryResetAt
+		result.PrimaryUsed = modelResult.PrimaryUsed
+		if modelResult.FiveHour.WindowMinutes == fiveHourMinutes {
+			result.FiveHour = modelResult.FiveHour
+			result.QuotaCheckedAt = modelResult.FiveHour.ObservedAt
+		}
+		if modelResult.Weekly.WindowMinutes == weeklyMinutes {
+			result.Weekly = modelResult.Weekly
+			if modelResult.Weekly.ObservedAt.After(result.QuotaCheckedAt) {
+				result.QuotaCheckedAt = modelResult.Weekly.ObservedAt
+			}
+		}
 		result.Attempts = modelResult.Attempts
 		result.StatusCode = modelResult.StatusCode
 		result.ResponseReceived = modelResult.ResponseReceived
@@ -665,6 +695,8 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) runRecord {
 		record.Accounts = append(record.Accounts, result)
 		if result.ResponseReceived {
 			record.Succeeded++
+		} else {
+			record.Failed++
 		}
 		logHost("info", "codex daily prewarm account finished", map[string]any{
 			"account": fingerprint, "status": result.StatusCode, "response_received": result.ResponseReceived,
@@ -1158,13 +1190,6 @@ func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result a
 	r.mu.Lock()
 	window := r.state.Accounts[account]
 	window.LastPrewarmAt = result.FinishedAt.UTC()
-	if window.FiveHour.WindowMinutes == fiveHourMinutes {
-		window.LastPrewarmResetAt = window.FiveHour.ResetAt
-	} else if !window.ResetAt.IsZero() && !window.LastProbeAt.IsZero() {
-		if duration := window.ResetAt.Sub(window.LastProbeAt); duration >= 0 && duration <= 5*time.Hour+10*time.Minute {
-			window.LastPrewarmResetAt = window.ResetAt
-		}
-	}
 	if result.ResponseReceived {
 		window.LastProbeAt = result.FinishedAt.UTC()
 		window.RetryAfter = time.Time{}
@@ -1186,6 +1211,13 @@ func (r *runtime) recordAccountResult(cfg pluginConfig, account string, result a
 		}
 	} else if result.ErrorCode == "usage_limit_reached" && !result.PrimaryResetAt.IsZero() {
 		window.RetryAfter = result.PrimaryResetAt
+	}
+	if window.FiveHour.WindowMinutes == fiveHourMinutes {
+		window.LastPrewarmResetAt = window.FiveHour.ResetAt
+	} else if !window.ResetAt.IsZero() && !window.LastProbeAt.IsZero() {
+		if duration := window.ResetAt.Sub(window.LastProbeAt); duration >= 0 && duration <= 5*time.Hour+10*time.Minute {
+			window.LastPrewarmResetAt = window.ResetAt
+		}
 	}
 	r.state.Accounts[account] = window
 	r.mu.Unlock()
@@ -1216,7 +1248,7 @@ func (r *runtime) markCompleted(cfg pluginConfig, date, job, account string) {
 	}
 }
 
-func (r *runtime) appendRun(cfg pluginConfig, record runRecord) {
+func (r *runtime) appendRun(cfg pluginConfig, record runRecord) runRecord {
 	r.mu.Lock()
 	r.state.History = append([]runRecord{record}, r.state.History...)
 	if len(r.state.History) > maxHistoryItems {
@@ -1224,6 +1256,11 @@ func (r *runtime) appendRun(cfg pluginConfig, record runRecord) {
 	}
 	r.mu.Unlock()
 	if err := r.persistState(cfg.StatePath); err != nil {
+		record.Success = false
+		record.ErrorCode = "state_write_failed"
+		r.mu.Lock()
+		r.state.History[0] = record
+		r.mu.Unlock()
 		r.setLastError("state_write_failed")
 		logHost("error", "codex daily prewarm state write failed", map[string]any{"error_code": "state_write_failed"})
 	}
@@ -1231,6 +1268,7 @@ func (r *runtime) appendRun(cfg pluginConfig, record runRecord) {
 		r.setLastError("audit_write_failed")
 		logHost("error", "codex daily prewarm audit write failed", map[string]any{"error_code": "audit_write_failed"})
 	}
+	return record
 }
 
 func (r *runtime) persistState(path string) error {
@@ -1239,7 +1277,13 @@ func (r *runtime) persistState(path string) error {
 	r.mu.RLock()
 	state := cloneState(r.state)
 	r.mu.RUnlock()
-	return writeState(path, state)
+	err := writeState(path, state)
+	if err != nil {
+		r.mu.Lock()
+		r.stateWriteFailures++
+		r.mu.Unlock()
+	}
+	return err
 }
 
 func (r *runtime) setLastError(code string) {
