@@ -222,7 +222,7 @@ func pluginRegistration() registration {
 			Name:             "Codex 每日预热",
 			Version:          pluginVersion,
 			Author:           "buyandhide",
-			GitHubRepository: "https://zuowode.com:8850/buyandhide/cpa-plugin-codex-daily-prewarm",
+			GitHubRepository: "https://github.com/thee225/codex-daily-prewarm",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "automatic_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用每日定时预热；宿主保留字段 enabled 仅控制插件是否加载。"},
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只读查询并记录 would_warm，不发模型请求；默认开启。"},
