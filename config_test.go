@@ -99,3 +99,19 @@ func TestWarmAllowlistValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestNotificationConfig(t *testing.T) {
+	cfg, err := parsePluginConfig(nil)
+	if err != nil || cfg.DigestTime != "22:30" || cfg.QuietStart != "23:00" || cfg.QuietEnd != "08:00" || cfg.UnknownFailureStreak != 3 {
+		t.Fatalf("notification defaults: %#v %v", cfg, err)
+	}
+	cfg, err = parsePluginConfig([]byte("digest_time: '21:15'\nquiet_start: '22:45'\nquiet_end: '07:30'\nunknown_failure_streak: 4"))
+	if err != nil || cfg.DigestTime != "21:15" || cfg.QuietStart != "22:45" || cfg.QuietEnd != "07:30" || cfg.UnknownFailureStreak != 4 {
+		t.Fatalf("custom notifications: %#v %v", cfg, err)
+	}
+	for _, raw := range []string{"digest_time: '24:00'", "digest_time: '7:30'", "quiet_start: '23:60'", "quiet_end: '08'", "quiet_start: '08:00'", "unknown_failure_streak: 0", "unknown_failure_streak: 101"} {
+		if _, err := parsePluginConfig([]byte(raw)); err == nil {
+			t.Fatalf("invalid config accepted: %s", raw)
+		}
+	}
+}

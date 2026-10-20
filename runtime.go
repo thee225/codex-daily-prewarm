@@ -26,12 +26,13 @@ const (
 )
 
 type runtimeState struct {
-	Version    int                        `json:"version"`
-	Daily      map[string]map[string]bool `json:"daily,omitempty"`
-	Accounts   map[string]accountWindow   `json:"accounts,omitempty"`
-	Slots      map[string]scheduledSlot   `json:"slots,omitempty"`
-	History    []runRecord                `json:"history,omitempty"`
-	LastSyncAt time.Time                  `json:"last_sync_at,omitempty"`
+	Notifications notificationState          `json:"notifications,omitempty"`
+	Version       int                        `json:"version"`
+	Daily         map[string]map[string]bool `json:"daily,omitempty"`
+	Accounts      map[string]accountWindow   `json:"accounts,omitempty"`
+	Slots         map[string]scheduledSlot   `json:"slots,omitempty"`
+	History       []runRecord                `json:"history,omitempty"`
+	LastSyncAt    time.Time                  `json:"last_sync_at,omitempty"`
 }
 
 // The old daily map remains readable for rollback, but decisions use the
@@ -103,6 +104,7 @@ type accountResult struct {
 	Attempts24h      int               `json:"attempts_24h"`
 	WouldWarm        bool              `json:"would_warm,omitempty"`
 	StatusCode       int               `json:"status_code,omitempty"`
+	RequestSent      bool              `json:"request_sent,omitempty"`
 	ResponseReceived bool              `json:"response_received"`
 	FallbackUsed     bool              `json:"fallback_used,omitempty"`
 	SkipReason       string            `json:"skip_reason,omitempty"`
@@ -114,17 +116,18 @@ type accountResult struct {
 }
 
 type runtimeStatus struct {
-	Plugin      string                   `json:"plugin"`
-	Version     string                   `json:"version"`
-	Config      publicConfig             `json:"config"`
-	Running     bool                     `json:"running"`
-	NextRunAt   time.Time                `json:"next_run_at,omitempty"`
-	LastError   string                   `json:"last_error,omitempty"`
-	LastRun     *runRecord               `json:"last_run,omitempty"`
-	HistorySize int                      `json:"history_size"`
-	NextRuns    []jobNextRun             `json:"next_runs,omitempty"`
-	LastSyncAt  time.Time                `json:"last_sync_at,omitempty"`
-	Accounts    map[string]accountWindow `json:"accounts,omitempty"`
+	Notifications notificationStatus       `json:"notifications"`
+	Plugin        string                   `json:"plugin"`
+	Version       string                   `json:"version"`
+	Config        publicConfig             `json:"config"`
+	Running       bool                     `json:"running"`
+	NextRunAt     time.Time                `json:"next_run_at,omitempty"`
+	LastError     string                   `json:"last_error,omitempty"`
+	LastRun       *runRecord               `json:"last_run,omitempty"`
+	HistorySize   int                      `json:"history_size"`
+	NextRuns      []jobNextRun             `json:"next_runs,omitempty"`
+	LastSyncAt    time.Time                `json:"last_sync_at,omitempty"`
+	Accounts      map[string]accountWindow `json:"accounts,omitempty"`
 }
 
 type jobNextRun struct {
@@ -152,6 +155,9 @@ type runRequest struct {
 }
 
 type runtime struct {
+	notificationMu     sync.Mutex
+	now                func() time.Time
+	barkSend           barkSender
 	lifecycleMu        sync.Mutex
 	terminal           bool // guarded by lifecycleMu; native shutdown cannot be reopened
 	mu                 sync.RWMutex
@@ -198,6 +204,13 @@ type hostLogRequest struct {
 	Fields  map[string]any `json:"fields,omitempty"`
 }
 
+func (r *runtime) currentTime() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
 func newRuntime() *runtime {
 	cfg := defaultPluginConfig()
 	return &runtime{cfg: cfg, state: newState(), generation: 1, stopCh: make(chan struct{})}
@@ -219,7 +232,7 @@ func (r *runtime) configure(raw []byte) error {
 	}
 	r.mu.RLock()
 	oldPath := r.cfg.StatePath
-	hadState := len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0
+	hadState := len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0 || !r.state.Notifications.NextDigestAt.IsZero()
 	r.mu.RUnlock()
 	// Validate a different target before stopping the healthy old scheduler.
 	// The authoritative snapshot is still read after quiesce drains old runs.
@@ -234,7 +247,7 @@ func (r *runtime) configure(raw []byte) error {
 	}
 	r.quiesce()
 	r.mu.RLock()
-	hadState = len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0
+	hadState = len(r.state.Accounts) > 0 || len(r.state.Slots) > 0 || len(r.state.History) > 0 || len(r.state.Daily) > 0 || !r.state.Notifications.NextDigestAt.IsZero()
 	r.mu.RUnlock()
 	state, stateErr := readState(cfg.StatePath)
 	if errors.Is(stateErr, os.ErrNotExist) && hadState {
@@ -250,13 +263,16 @@ func (r *runtime) configure(raw []byte) error {
 	r.stopCh = make(chan struct{})
 	r.lastError = ""
 	r.mu.Unlock()
-	if cfg.AutomaticEnabled {
+	if cfg.AutomaticEnabled || cfg.BarkURL != "" {
 		scheduler := newRuntimeScheduler(r)
 		c := cron.New(cron.WithLocation(cfg.Location))
 		for _, job := range cfg.Jobs {
+			if !cfg.AutomaticEnabled {
+				break
+			}
 			job := job
 			if _, err := c.AddFunc(job.Schedule, func() {
-				scheduler.planSlot(job, latestCronSlot(job.CronSchedule, time.Now().In(cfg.Location)), time.Now())
+				scheduler.planSlot(job, latestCronSlot(job.CronSchedule, r.currentTime().In(cfg.Location)), r.currentTime())
 			}); err != nil {
 				return fmt.Errorf("register job %s: %w", job.Name, err)
 			}
@@ -265,7 +281,7 @@ func (r *runtime) configure(raw []byte) error {
 		r.cron = c
 		r.scheduler = scheduler
 		r.mu.Unlock()
-		scheduler.bootstrap(cfg, time.Now())
+		scheduler.bootstrap(cfg, r.currentTime())
 		c.Start()
 	}
 	return nil
@@ -474,7 +490,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 	stop := r.stopCh
 	initialWriteFailures := r.stateWriteFailures
 	r.mu.RUnlock()
-	now := time.Now().In(cfg.Location)
+	now := r.currentTime().In(cfg.Location)
 	record = runRecord{
 		ID:            fmt.Sprintf("%d", now.UnixNano()),
 		Job:           request.Job.Name,
@@ -495,7 +511,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 		logHost("error", "codex daily prewarm audit write failed", map[string]any{"error_code": "audit_write_failed"})
 	}
 	defer func() {
-		record.FinishedAt = time.Now().In(cfg.Location)
+		record.FinishedAt = r.currentTime().In(cfg.Location)
 		r.mu.RLock()
 		writeFailed := r.stateWriteFailures != initialWriteFailures
 		r.mu.RUnlock()
@@ -506,9 +522,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 		if record.ErrorCode == "interrupted" {
 			r.requeueInterrupted(request)
 		}
-		if request.Trigger == "schedule" || request.Trigger == "reset_followup" || request.Notify {
-			record.BarkStatus = sendPrewarmSuccessBark(cfg, record)
-		}
+		record.BarkStatus = r.recordNotifications(cfg, &record, request.Notify)
 		record = r.appendRun(cfg, record)
 	}()
 	if runStopped(stop) {
@@ -682,6 +696,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 		}
 		result.Attempts = modelResult.Attempts
 		result.StatusCode = modelResult.StatusCode
+		result.RequestSent = modelResult.RequestSent
 		result.ResponseReceived = modelResult.ResponseReceived
 		result.FallbackUsed = modelResult.FallbackUsed
 		result.ErrorCode = modelResult.ErrorCode
@@ -820,6 +835,7 @@ func executeAccountWithGuard(cfg pluginConfig, job prewarmJob, auth pluginapi.Ho
 				result.ErrorCode = "interrupted"
 				break
 			}
+			result.RequestSent = true
 			raw, callErr := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
 				HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 					EntryProtocol: "openai", ExitProtocol: "openai", Model: model,
@@ -1297,7 +1313,8 @@ func (r *runtime) status() runtimeStatus {
 	defer r.mu.RUnlock()
 	status := runtimeStatus{
 		Plugin: pluginName, Version: pluginVersion, Config: r.cfg.public(), Running: r.running,
-		LastError: r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
+		Notifications: r.state.Notifications.status(r.cfg, r.currentTime()),
+		LastError:     r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
 		Accounts: make(map[string]accountWindow, len(r.state.Accounts)),
 	}
 	for account, window := range r.state.Accounts {
@@ -1358,6 +1375,7 @@ func readState(path string) (runtimeState, error) {
 	if state.Slots == nil {
 		state.Slots = make(map[string]scheduledSlot)
 	}
+	state.Notifications.init()
 	// Import recent v0.4 model attempts once so the new rolling limit also
 	// covers calls made shortly before the upgrade.
 	knownAttempts := make(map[string]bool, len(state.Accounts))
@@ -1441,6 +1459,7 @@ func writeState(path string, state runtimeState) error {
 
 func cloneState(state runtimeState) runtimeState {
 	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), Slots: make(map[string]scheduledSlot), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
+	clone.Notifications = cloneNotifications(state.Notifications)
 	for date, accounts := range state.Daily {
 		clone.Daily[date] = make(map[string]bool, len(accounts))
 		for account, done := range accounts {

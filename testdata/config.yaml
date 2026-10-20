@@ -18,6 +18,10 @@ plugins:
       automatic_enabled: false
       schedule: "0 6 * * *"
       timezone: "Asia/Shanghai"
+      digest_time: "22:30"
+      quiet_start: "23:00"
+      quiet_end: "08:00"
+      unknown_failure_streak: 3
       model: "gpt-5.6-luna"
       prompt: "hi"
       expected_account_count: 3

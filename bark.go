@@ -34,53 +34,33 @@ func barkPushTarget(raw string) (string, string, error) {
 	return u.String(), key, nil
 }
 
-func sendPrewarmSuccessBark(cfg pluginConfig, record runRecord) string {
-	return sendPrewarmSuccessBarkWith(cfg, record, func(request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
-		raw, err := callHost(pluginabi.MethodHostHTTPDo, request)
-		if err != nil {
-			return pluginapi.HTTPResponse{}, err
-		}
-		var response pluginapi.HTTPResponse
-		if json.Unmarshal(raw, &response) != nil {
-			return pluginapi.HTTPResponse{}, errors.New("invalid host HTTP response")
-		}
-		return response, nil
-	})
+type barkSender func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
+
+func sendBarkHTTP(request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	raw, err := callHost(pluginabi.MethodHostHTTPDo, request)
+	if err != nil {
+		return pluginapi.HTTPResponse{}, err
+	}
+	var response pluginapi.HTTPResponse
+	if json.Unmarshal(raw, &response) != nil {
+		return pluginapi.HTTPResponse{}, errors.New("invalid host HTTP response")
+	}
+	return response, nil
 }
 
-func sendPrewarmSuccessBarkWith(cfg pluginConfig, record runRecord, send func(pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)) string {
-	var successful []accountResult
-	for _, item := range record.Accounts {
-		if item.ResponseReceived {
-			successful = append(successful, item)
-		}
-	}
-	if len(successful) == 0 {
-		return "no_successful_prewarm"
-	}
+func sendBarkWith(cfg pluginConfig, title, bodyText, level string, send barkSender) string {
 	if cfg.BarkURL == "" {
 		return "not_configured"
-	}
-	hour := record.FinishedAt.In(cfg.Location).Hour()
-	if hour >= 23 || hour < 8 {
-		return "quiet_hours"
 	}
 	pushURL, deviceKey, err := barkPushTarget(cfg.BarkURL)
 	if err != nil {
 		return "invalid_bark_url"
 	}
-	lines := []string{fmt.Sprintf("预热成功 %d 个账号", len(successful))}
-	for _, item := range successful {
-		line := item.Account
-		if !item.QuotaCheckedAt.IsZero() {
-			line += fmt.Sprintf(" 5h %.0f%% 周 %.0f%%", 100-item.FiveHour.UsedPercent, 100-item.Weekly.UsedPercent)
-		}
-		lines = append(lines, line)
-	}
 	body, err := json.Marshal(map[string]string{
 		"device_key": deviceKey,
-		"title":      "Codex 预热成功",
-		"body":       strings.Join(lines, "\n"),
+		"title":      title,
+		"body":       bodyText,
+		"level":      level,
 		"group":      "codex-daily-prewarm",
 	})
 	if err != nil {

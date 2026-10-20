@@ -11,6 +11,8 @@ import (
 // auditEntry contains only anonymized account IDs and bounded execution metadata.
 // It must never include request bodies, response bodies, API keys, or OAuth data.
 type auditEntry struct {
+	BarkStatus    string     `json:"bark_status,omitempty"`
+	DigestEnd     time.Time  `json:"digest_end,omitempty"`
 	At            time.Time  `json:"at"`
 	Event         string     `json:"event"`
 	RunID         string     `json:"run_id"`

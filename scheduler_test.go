@@ -125,6 +125,7 @@ func TestResetPlanSurvivesEarlyHourlyRead(t *testing.T) {
 
 func TestSchedulerStateWriteFailureDoesNotConsumeSlot(t *testing.T) {
 	cfg := defaultPluginConfig()
+	cfg.AutomaticEnabled = true
 	blocker := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)

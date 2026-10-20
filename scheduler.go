@@ -70,6 +70,9 @@ func latestCronSlot(schedule cron.Schedule, now time.Time) time.Time {
 
 func (s *runtimeScheduler) bootstrap(cfg pluginConfig, now time.Time) {
 	for _, job := range cfg.Jobs {
+		if !cfg.AutomaticEnabled {
+			break
+		}
 		latest := latestCronSlot(job.CronSchedule, now.In(cfg.Location))
 		if !latest.IsZero() && sameLocalDate(latest, now, cfg.Location) && now.Sub(latest) <= 70*time.Minute {
 			s.planSlot(job, latest, now)
@@ -127,19 +130,20 @@ func (s *runtimeScheduler) loop() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	s.processDue(time.Now())
+	s.processDue(s.runtime.currentTime())
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case now := <-ticker.C:
-			s.processDue(now)
+		case <-ticker.C:
+			s.processDue(s.runtime.currentTime())
 		}
 	}
 }
 
 func (s *runtimeScheduler) processDue(now time.Time) {
 	r := s.runtime
+	r.processNotifications(now)
 	var requests []runRequest
 	previousSlots := make(map[string]scheduledSlot)
 	previousAccounts := make(map[string]accountWindow)
@@ -149,6 +153,10 @@ func (s *runtimeScheduler) processDue(now time.Time) {
 		return
 	}
 	cfg := r.cfg
+	if !cfg.AutomaticEnabled {
+		r.mu.Unlock()
+		return
+	}
 	jobs := make(map[string]prewarmJob, len(cfg.Jobs))
 	for _, job := range cfg.Jobs {
 		jobs[job.Name] = job

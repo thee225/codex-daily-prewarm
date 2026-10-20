@@ -74,8 +74,9 @@ func TestResourcePageCannotStartUnauthenticatedRun(t *testing.T) {
 func TestStatusPageDisplaysConfiguredTimezone(t *testing.T) {
 	cfg := defaultPluginConfig().public()
 	page := renderStatusPage(runtimeStatus{
-		Config:    cfg,
-		NextRunAt: time.Date(2026, 9, 24, 10, 0, 38, 0, time.UTC),
+		Config:        cfg,
+		Notifications: notificationStatus{LastDigestAt: time.Date(2026, 9, 24, 14, 30, 0, 0, time.UTC), LastDigestResult: "accepted", NextDigestAt: time.Date(2026, 9, 25, 14, 30, 0, 0, time.UTC)},
+		NextRunAt:     time.Date(2026, 9, 24, 10, 0, 38, 0, time.UTC),
 		LastRun: &runRecord{
 			Job: "default", FinishedAt: time.Date(2026, 9, 24, 11, 9, 22, 0, time.UTC),
 			Discovered: 1, QuotaQueried: 1, WouldWarm: 1, Skipped: 1,
@@ -85,6 +86,9 @@ func TestStatusPageDisplaysConfiguredTimezone(t *testing.T) {
 	})
 	if !strings.Contains(page, "2026-09-24 18:00:38 CST") || !strings.Contains(page, "2026-09-24 19:09:18 CST") {
 		t.Fatal("planned times were not shown in Asia/Shanghai")
+	}
+	if !strings.Contains(page, "最近发送 2026-09-24 22:30:00 CST · 结果 accepted · 下次日报 2026-09-25 22:30:00 CST") {
+		t.Fatal("digest status missing from management page")
 	}
 	if !strings.Contains(page, "查询账号 1/1，符合预热 1，预热账号 0，有效模型回复 0，跳过 1，错误 无") || !strings.Contains(page, "观察模式：符合预热条件，未发模型请求") || strings.Contains(page, "成功 0/1") {
 		t.Fatal("observation was presented as a failed model request")

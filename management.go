@@ -22,7 +22,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "读取插件状态与最近一次执行结果。"},
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/history", Description: "读取最近 30 次匿名化执行历史。"},
-			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；传 {\"notify\":true} 时仅在实际预热成功后发送 Bark；安全门槛始终生效。"},
+			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；传 {\"notify\":true} 时即时发送结果 Bark；安全门槛始终生效。"},
 		},
 	}
 }
@@ -170,7 +170,16 @@ func renderStatusPage(status runtimeStatus) string {
 			accounts.WriteString("<tr><td>" + html.EscapeString(item.Account) + "</td><td>" + html.EscapeString(item.QuotaStatus) + "</td><td>" + quota + "</td><td>" + html.EscapeString(reason) + "</td><td>" + fmt.Sprintf("%d", item.Attempts24h) + "</td></tr>")
 		}
 	}
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.hint{color:#667085;font-size:14px}</style></head><body><h1>Codex 每日预热</h1><section><h2>立即预热</h2><p>立即查询全部账号额度；符合现有条件的账号马上发起一次轻量请求，其余账号跳过。仍受灰度名单、dry-run、五小时冷却和滚动 24 小时次数限制。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>重置补查</dt><dd>` + html.EscapeString(followupMode) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>待执行的账号补查</h2><table><tr><th>匿名账号</th><th>类型</th><th>计划时间</th></tr>` + followups.String() + `</table></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p>` + statusPageActionScript + `</body></html>`
+	digest := status.Notifications
+	digestText := fmt.Sprintf("最近发送 %s · 结果 %s · 下次日报 %s", formatNotificationTime(digest.LastDigestAt, location), digest.LastDigestResult, formatNotificationTime(digest.NextDigestAt, location))
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}dt{color:#667085}dd{margin:4px 0 14px;font-weight:600}code{background:#f4f6f8;padding:2px 6px;border-radius:5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #dde3ea}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}.hint{color:#667085;font-size:14px}</style></head><body><h1>Codex 每日预热</h1><section><h2>立即预热</h2><p>立即查询全部账号额度；符合现有条件的账号马上发起一次轻量请求，其余账号跳过。仍受灰度名单、dry-run、五小时冷却和滚动 24 小时次数限制。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><dl><dt>状态</dt><dd>` + html.EscapeString(map[bool]string{true: "运行中", false: "空闲"}[status.Running]) + `</dd><dt>自动任务</dt><dd>` + html.EscapeString(map[bool]string{true: "已启用", false: "已停用"}[status.Config.AutomaticEnabled]) + `</dd><dt>dry-run</dt><dd>` + html.EscapeString(map[bool]string{true: "开启", false: "关闭"}[status.Config.DryRun]) + `</dd><dt>重置补查</dt><dd>` + html.EscapeString(followupMode) + `</dd><dt>定时任务</dt>` + plans.String() + `<dt>下次运行</dt><dd>` + html.EscapeString(next) + `</dd><dt>Bark 日报</dt><dd>` + html.EscapeString(digestText) + `</dd><dt>上次运行</dt><dd>` + html.EscapeString(last) + `</dd></dl></section><section><h2>待执行的账号补查</h2><table><tr><th>匿名账号</th><th>类型</th><th>计划时间</th></tr>` + followups.String() + `</table></section><section><h2>最近逐账号检查</h2><table><tr><th>匿名账号</th><th>查询</th><th>剩余 5h / 周</th><th>结果</th><th>24h 调用</th></tr>` + accounts.String() + `</table></section><p>完整匿名化历史位于 CPA 管理 API。</p>` + statusPageActionScript + `</body></html>`
+}
+
+func formatNotificationTime(at time.Time, location *time.Location) string {
+	if at.IsZero() {
+		return "暂无"
+	}
+	return at.In(location).Format("2006-01-02 15:04:05 MST")
 }
 
 // The resource page is public. Only the authenticated management route may start a run.
@@ -245,6 +254,9 @@ const statusPageActionScript = `<script>
         '重置补查：' + state.config.reset_followup_mode,
         '当前：' + (state.running ? '运行中' : '空闲'),
         '运行错误：' + (state.last_error || '无'),
+        '日报最近发送：' + (formatTime(state.notifications?.last_digest_at, state.config.timezone) || '暂无'),
+        '日报结果：' + (state.notifications?.last_digest_result || '暂无'),
+        '下次日报：' + (formatTime(state.notifications?.next_digest_at, state.config.timezone) || '未计划'),
         '下次运行：' + (formatTime(state.next_run_at, state.config.timezone) || '未计划'),
         '最近运行：' + (last ? [formatTime(last.finished_at, state.config.timezone), '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '预热成功 ' + last.succeeded_accounts, '跳过 ' + last.skipped_accounts, '失败 ' + (last.failed_accounts ?? 0), '错误 ' + (last.error_code || '无'), 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
         '', '待执行账号补查：'

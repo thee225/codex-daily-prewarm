@@ -25,6 +25,10 @@ type pluginConfig struct {
 	AutomaticEnabled     bool           `json:"automatic_enabled"`
 	DryRun               bool           `json:"dry_run"`
 	BarkURL              string         `json:"-"`
+	DigestTime           string         `json:"digest_time"`
+	QuietStart           string         `json:"quiet_start"`
+	QuietEnd             string         `json:"quiet_end"`
+	UnknownFailureStreak int            `json:"unknown_failure_streak"`
 	WarmAllowlist        []string       `json:"warm_allowlist,omitempty"`
 	ResetFollowupMode    string         `json:"reset_followup_mode"`
 	Schedule             string         `json:"schedule"`
@@ -63,6 +67,10 @@ type yamlPluginConfig struct {
 	AutomaticEnabled     *bool            `yaml:"automatic_enabled"`
 	DryRun               *bool            `yaml:"dry_run"`
 	BarkURL              string           `yaml:"bark_url"`
+	DigestTime           string           `yaml:"digest_time"`
+	QuietStart           string           `yaml:"quiet_start"`
+	QuietEnd             string           `yaml:"quiet_end"`
+	UnknownFailureStreak *int             `yaml:"unknown_failure_streak"`
 	WarmAllowlist        []string         `yaml:"warm_allowlist"`
 	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"` // Accepted for old CPA configs; intentionally ignored.
 	ResetFollowupMode    string           `yaml:"reset_followup_mode"`
@@ -84,6 +92,10 @@ func defaultPluginConfig() pluginConfig {
 	schedule, _ := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow).Parse(defaultSchedule)
 	return pluginConfig{
 		AutomaticEnabled:     false,
+		DigestTime:           "22:30",
+		QuietStart:           "23:00",
+		QuietEnd:             "08:00",
+		UnknownFailureStreak: 3,
 		DryRun:               true,
 		ResetFollowupMode:    "observe",
 		Schedule:             defaultSchedule,
@@ -185,6 +197,31 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		cfg.StatePath = filepath.Clean(value)
 	}
 
+	for _, item := range []struct {
+		name   string
+		input  string
+		target *string
+	}{
+		{"digest_time", input.DigestTime, &cfg.DigestTime},
+		{"quiet_start", input.QuietStart, &cfg.QuietStart},
+		{"quiet_end", input.QuietEnd, &cfg.QuietEnd},
+	} {
+		if item.input != "" {
+			*item.target = strings.TrimSpace(item.input)
+		}
+		if _, err := time.Parse("15:04", *item.target); err != nil || len(*item.target) != 5 {
+			return cfg, fmt.Errorf("%s must use HH:MM between 00:00 and 23:59", item.name)
+		}
+	}
+	if cfg.QuietStart == cfg.QuietEnd {
+		return cfg, fmt.Errorf("quiet_start and quiet_end must differ")
+	}
+	if input.UnknownFailureStreak != nil {
+		cfg.UnknownFailureStreak = *input.UnknownFailureStreak
+	}
+	if cfg.UnknownFailureStreak < 1 || cfg.UnknownFailureStreak > 100 {
+		return cfg, fmt.Errorf("unknown_failure_streak must be between 1 and 100")
+	}
 	if cfg.ExpectedAccountCount < 0 || cfg.ExpectedAccountCount > 100 {
 		return cfg, fmt.Errorf("expected_account_count must be between 0 and 100")
 	}
@@ -318,6 +355,10 @@ type publicConfig struct {
 	AutomaticEnabled     bool        `json:"automatic_enabled"`
 	DryRun               bool        `json:"dry_run"`
 	BarkConfigured       bool        `json:"bark_configured"`
+	DigestTime           string      `json:"digest_time"`
+	QuietStart           string      `json:"quiet_start"`
+	QuietEnd             string      `json:"quiet_end"`
+	UnknownFailureStreak int         `json:"unknown_failure_streak"`
 	WarmAllowlist        []string    `json:"warm_allowlist,omitempty"`
 	ResetFollowupMode    string      `json:"reset_followup_mode"`
 	Schedule             string      `json:"schedule"`
@@ -349,6 +390,10 @@ func (cfg pluginConfig) public() publicConfig {
 		AutomaticEnabled:     cfg.AutomaticEnabled,
 		DryRun:               cfg.DryRun,
 		BarkConfigured:       cfg.BarkURL != "",
+		DigestTime:           cfg.DigestTime,
+		QuietStart:           cfg.QuietStart,
+		QuietEnd:             cfg.QuietEnd,
+		UnknownFailureStreak: cfg.UnknownFailureStreak,
 		WarmAllowlist:        append([]string(nil), cfg.WarmAllowlist...),
 		ResetFollowupMode:    cfg.ResetFollowupMode,
 		Schedule:             cfg.Schedule,
