@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -22,6 +24,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/status", Description: "读取插件状态与最近一次执行结果。"},
 			{Method: http.MethodGet, Path: managementRoutePrefix + "/history", Description: "读取最近 30 次匿名化执行历史。"},
+			{Method: http.MethodGet, Path: managementRoutePrefix + "/account-details", Description: "认证后读取账号显示名称与套餐；不查询上游额度。"},
 			{Method: http.MethodPost, Path: managementRoutePrefix + "/run-now", Description: "立即执行一次；传 {\"notify\":true} 时即时发送结果 Bark；安全门槛始终生效。"},
 		},
 	}
@@ -47,6 +50,8 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 		return jsonManagementResponse(http.StatusOK, app.status())
 	case method == http.MethodGet && isManagementPath(request.Path, "/history"):
 		return jsonManagementResponse(http.StatusOK, map[string]any{"history": app.history()})
+	case method == http.MethodGet && isManagementPath(request.Path, "/account-details"):
+		return accountDetailsResponse()
 	case method == http.MethodPost && isManagementPath(request.Path, "/run-now"):
 		var input struct {
 			Force  bool   `json:"force"`
@@ -71,6 +76,61 @@ func dispatchManagement(request pluginapi.ManagementRequest) pluginapi.Managemen
 	default:
 		return jsonManagementResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 	}
+}
+
+type accountDisplayDetail struct {
+	Name        string `json:"name"`
+	AccountType string `json:"account_type,omitempty"`
+}
+
+// Resolve names only for this authenticated, explicit opt-in request. Never add
+// identities to persisted state, run records, audit events or notifications.
+func accountDetailsResponse() pluginapi.ManagementResponse {
+	raw, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	var response authListResponse
+	if err != nil || json.Unmarshal(raw, &response) != nil {
+		return jsonManagementResponse(http.StatusServiceUnavailable, map[string]any{"error": "account_details_unavailable"})
+	}
+	details := make(map[string]accountDisplayDetail)
+	for _, auth := range response.Files {
+		if (strings.EqualFold(auth.Provider, "codex") || strings.EqualFold(auth.Type, "codex")) && strings.TrimSpace(auth.ID) != "" {
+			name := strings.TrimSpace(auth.Label)
+			if name == "" {
+				name = strings.TrimSpace(auth.Email)
+			}
+			if name == "" {
+				name = filepath.Base(strings.TrimSpace(auth.Name))
+				if name == "." || name == "/" {
+					name = ""
+				}
+			}
+			details[accountFingerprint(auth.ID)] = accountDisplayDetail{Name: name, AccountType: accountDisplayPlan(auth)}
+		}
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{"accounts": details})
+}
+
+func accountDisplayPlan(auth pluginapi.HostAuthFileEntry) string {
+	if plan := safeAccountType(auth.AccountType); plan != "" {
+		return plan
+	}
+	if strings.TrimSpace(auth.AuthIndex) == "" {
+		return ""
+	}
+	// Some CPA versions expose "oauth" rather than the subscription plan in
+	// account_type. Read only plan metadata via the existing local host callback.
+	raw, err := callHost(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: auth.AuthIndex})
+	if err != nil {
+		return ""
+	}
+	var credential pluginapi.HostAuthGetResponse
+	var metadata struct {
+		PlanType string `json:"plan_type"`
+	}
+	if json.Unmarshal(raw, &credential) != nil || json.Unmarshal(credential.JSON, &metadata) != nil {
+		return ""
+	}
+	return safeAccountType(metadata.PlanType)
 }
 
 func isManagementPath(path, suffix string) bool {
@@ -108,7 +168,7 @@ func htmlManagementResponse(body string) pluginapi.ManagementResponse {
 // only through the already authenticated management status route.
 // This shell reads a same-origin management key; escape every dynamic value.
 func renderStatusShell(model string) string {
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><p class="hint">巡检模型：` + html.EscapeString(model) + `</p><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><button id="unlock-status" type="button" hidden>验证并查看详情</button><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex 每日预热</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#17202a}section{border:1px solid #dde3ea;border-radius:14px;padding:20px;margin-bottom:18px}button{background:#175cd3;color:#fff;border:0;border-radius:8px;cursor:pointer}.hint{color:#667085;font-size:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>Codex 每日预热</h1><p class="hint">巡检模型：` + html.EscapeString(model) + `</p><section><h2>立即预热</h2><p>先查询全部账号额度；符合条件的账号发起一次轻量请求，其余跳过。灰度名单、dry-run、五小时冷却和 24 小时次数限制仍然生效。</p><button id="run-now" type="button">一键预热（先查额度）</button><p id="run-result" role="status" aria-live="polite" class="hint"></p></section><section><h2>运行状态</h2><p><label><input id="show-account-details" type="checkbox"> 显示账户详情（邮箱 / 标签 · 套餐）</label></p><p class="hint">仅认证后加载；当前浏览器记住开关，匿名指纹始终保留供核对。</p><button id="unlock-status" type="button" hidden>验证并查看详情</button><pre id="status-details" class="hint">正在通过 CPA 管理认证加载状态…</pre></section>` + statusPageActionScript + `</body></html>`
 }
 
 func renderStatusPage(status runtimeStatus) string {
@@ -191,6 +251,10 @@ const statusPageActionScript = `<script>
   const message = document.getElementById('run-result');
   const details = document.getElementById('status-details');
   const unlock = document.getElementById('unlock-status');
+  const accountToggle = document.getElementById('show-account-details');
+  const preferenceKey = 'cpa-prewarm-show-account-details';
+  try { accountToggle.checked = localStorage.getItem(preferenceKey) === 'true'; } catch (_) {}
+  let statusLoad = 0;
   const route = '/v0/management/plugins/codex-daily-prewarm';
   let sessionKey = '';
   let ignoreRememberedKey = false;
@@ -238,6 +302,8 @@ const statusPageActionScript = `<script>
 
   async function loadStatus() {
     if (!details) return;
+    const loadID = ++statusLoad;
+    const showAccountDetails = accountToggle.checked;
     const key = sessionKey || (!ignoreRememberedKey && rememberedKey());
     if (!key) {
       unlock.hidden = false;
@@ -246,8 +312,22 @@ const statusPageActionScript = `<script>
     }
     try {
       const state = await managementRequest('/status', {method: 'GET'}, key);
+      let accountDetails = {};
+      let accountWarning = '';
+      if (showAccountDetails) {
+        try { accountDetails = (await managementRequest('/account-details', {method: 'GET'}, key)).accounts || {}; }
+        catch (_) { accountWarning = '账户详情暂不可用，仍显示匿名指纹；可关闭后重新打开开关重试。'; }
+      }
+      if (loadID !== statusLoad) return;
       unlock.hidden = true;
       const last = state.last_run;
+      function accountName(account, fallbackType) {
+        const info = accountDetails[account];
+        if (!showAccountDetails || !info?.name) return account;
+        const type = info.account_type || fallbackType;
+        const plan = {plus:'Plus',team:'Team',business:'Business',enterprise:'Enterprise',edu:'Edu',pro:'Pro',free:'Free'}[type] || '未知套餐';
+        return info.name + ' · ' + plan + '（' + account + '）';
+      }
       const lines = [
         '自动任务：' + (state.config.automatic_enabled ? '已启用' : '已停用'),
         'dry-run：' + (state.config.dry_run ? '开启' : '关闭'),
@@ -264,22 +344,41 @@ const statusPageActionScript = `<script>
       for (const [account, window] of Object.entries(state.accounts || {}).sort()) {
         for (const [label, field] of [['5h', 'five_hour_followup_at'], ['周', 'weekly_followup_at'], ['查询重试', 'quota_retry_at']]) {
           const at = formatTime(window[field], state.config.timezone);
-          if (at) lines.push(account + ' · ' + label + ' · ' + at);
+          if (at) lines.push(accountName(account, last?.accounts?.find(item => item.account === account)?.account_type) + ' · ' + label + ' · ' + at);
         }
       }
       lines.push('', '最近逐账号检查：');
       for (const item of (last?.accounts || [])) {
         const known = item.quota_status === 'confirmed' && !!formatTime(item.quota_checked_at, state.config.timezone) && item.five_hour?.window_minutes === 300 && item.weekly?.window_minutes === 10080 && !!formatTime(item.five_hour.reset_at, state.config.timezone) && !!formatTime(item.weekly.reset_at, state.config.timezone);
         const quota = known ? '5h ' + (100 - (item.five_hour?.used_percent ?? 0)).toFixed(0) + '% / 周 ' + (100 - (item.weekly?.used_percent ?? 0)).toFixed(0) + '%' : '额度未知';
-        lines.push([item.account, quota, item.skip_reason || item.error_code || (item.response_received ? '预热成功' : '无结果'), '24h 调用 ' + item.attempts_24h].join(' · '));
+        lines.push([accountName(item.account, item.account_type), quota, item.skip_reason || item.error_code || (item.response_received ? '预热成功' : '无结果'), '24h 调用 ' + item.attempts_24h].join(' · '));
       }
-      details.textContent = lines.join('\n');
+      if (accountWarning) lines.push('', accountWarning);
+      details.textContent = '';
+      for (const part of lines.join('\n').split(/(acct-[a-f0-9]{12})/g)) {
+        if (/^acct-[a-f0-9]{12}$/.test(part)) {
+          const fingerprint = document.createElement('span');
+          fingerprint.style.color = '#667085';
+          fingerprint.style.fontSize = '0.85em';
+          fingerprint.textContent = part;
+          details.appendChild(fingerprint);
+        } else {
+          details.appendChild(document.createTextNode(part));
+        }
+      }
     } catch (error) {
+      if (loadID !== statusLoad) return;
       unlock.hidden = false;
       details.textContent = error instanceof Error ? error.message : '状态加载失败';
     }
   }
 
+  accountToggle.addEventListener('change', () => {
+    // Clear previously displayed identities immediately, including when a fetch is pending.
+    details.textContent = '正在加载状态…';
+    try { localStorage.setItem(preferenceKey, String(accountToggle.checked)); } catch (_) {}
+    loadStatus();
+  });
   loadStatus();
 
   unlock.addEventListener('click', () => {
