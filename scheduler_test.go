@@ -147,3 +147,127 @@ func TestSchedulerStateWriteFailureDoesNotConsumeSlot(t *testing.T) {
 		t.Fatal("unpersisted slot was consumed or dispatched")
 	}
 }
+
+func TestQuotaRefreshScheduleIsIndependentAndCoalesces(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("automatic_enabled: true\nquota_refresh_schedule: '*/30 * * * *'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	r := newRuntime()
+	r.cfg = cfg
+	s := newRuntimeScheduler(r)
+	r.scheduler = s
+	jobs := scheduledJobs(cfg)
+	if len(jobs) != 2 {
+		t.Fatalf("jobs: %+v", jobs)
+	}
+	quota := jobs[1]
+	for _, hour := range []int{0, 4, 5, 12, 23} {
+		base := time.Date(2026, 10, 21, hour, 0, 0, 0, cfg.Location)
+		s.planSlot(quota, base, base)
+		_, exists := r.state.Slots[slotKey(quota.Name, base)]
+		if exists == (hour >= 5) {
+			t.Fatalf("unexpected quota slot at %v: %v", base, exists)
+		}
+		if hour >= 5 {
+			if _, ok := r.state.Slots[slotKey(quota.Name, base.Add(30*time.Minute))]; !ok {
+				t.Fatal("coalescing lost next half-hour slot")
+			}
+		}
+	}
+	cfg.AutomaticEnabled = false
+	r.cfg = cfg
+	jobs = scheduledJobs(cfg)
+	if len(jobs) != 1 || !jobs[0].QuotaOnly {
+		t.Fatal("quota refresh must survive prewarm disabled")
+	}
+	noon := time.Date(2026, 10, 21, 12, 0, 0, 0, cfg.Location)
+	s.planSlot(jobs[0], noon, noon)
+	if _, ok := r.state.Slots[slotKey(quota.Name, noon)]; !ok {
+		t.Fatal("disabled prewarm incorrectly suppresses refresh")
+	}
+}
+
+func TestQuotaRefreshDispatchAtNightWithoutPrewarming(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("quota_refresh_schedule: '*/30 * * * *'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	r := newRuntime()
+	r.cfg = cfg
+	s := newRuntimeScheduler(r)
+	r.scheduler = s
+	received := make(chan runRequest, 1)
+	r.runTask = func(_ pluginConfig, req runRequest) runRecord { received <- req; return runRecord{} }
+	base := time.Date(2026, 10, 21, 0, 30, 0, 0, cfg.Location)
+	job := scheduledJobs(cfg)[0]
+	s.planSlot(job, base, base)
+	s.processDue(base.Add(time.Minute))
+	select {
+	case req := <-received:
+		if !req.ReadOnly || req.Trigger != "quota_refresh" {
+			t.Fatalf("unsafe request: %+v", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("night quota refresh did not dispatch")
+	}
+	r.runWG.Wait()
+	state, err := readState(cfg.StatePath)
+	if err != nil || state.Slots[slotKey(job.Name, base)].StartedAt.IsZero() {
+		t.Fatalf("slot not durable: %v", err)
+	}
+	restarted := newRuntime()
+	restarted.cfg = cfg
+	restarted.state = state
+	s2 := newRuntimeScheduler(restarted)
+	restarted.scheduler = s2
+	s2.planSlot(job, base, base)
+	if restarted.state.Slots[slotKey(job.Name, base)].StartedAt.IsZero() {
+		t.Fatal("restart consumed completed slot twice")
+	}
+}
+
+func TestQuotaRefreshConfigValidation(t *testing.T) {
+	if cfg, err := parsePluginConfig(nil); err != nil || cfg.QuotaCronSchedule != nil {
+		t.Fatal("legacy config changed")
+	}
+	for _, value := range []string{"invalid", "* * * * * *", "59 23 * * *"} {
+		if _, err := parsePluginConfig([]byte("quota_refresh_schedule: '" + value + "'")); err == nil {
+			t.Fatalf("accepted %s", value)
+		}
+	}
+}
+
+func TestQuotaRefreshCronRegistrationAndDayCoverage(t *testing.T) {
+	r := newRuntime()
+	path := filepath.Join(t.TempDir(), "state.json")
+	// A future wall clock avoids dispatching a real task while checking registration.
+	r.now = func() time.Time { return time.Date(2026, 10, 21, 2, 10, 0, 0, defaultPluginConfig().Location) }
+	r.runTask = func(pluginConfig, runRequest) runRecord { return runRecord{} }
+	if err := r.configure([]byte("automatic_enabled: false\nquota_refresh_schedule: '*/30 * * * *'\nstate_path: '" + path + "'\n")); err != nil {
+		t.Fatal(err)
+	}
+	defer r.shutdown()
+	if r.cron == nil || len(r.cron.Entries()) != 1 || r.scheduler == nil {
+		t.Fatal("independent quota cron not registered")
+	}
+	cfg, err := parsePluginConfig([]byte("automatic_enabled: true\nquota_refresh_schedule: '*/30 * * * *'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, quota, warm := 0, 0, 0
+	start := time.Date(2026, 10, 21, 0, 0, 0, 0, cfg.Location)
+	for at := start; at.Before(start.Add(24 * time.Hour)); at = at.Add(30 * time.Minute) {
+		total++
+		if quotaCoveredByPrewarm(cfg, at) {
+			warm++
+		} else {
+			quota++
+		}
+	}
+	if total != 48 || warm != 19 || quota != 29 {
+		t.Fatalf("daily query coverage: total=%d warm=%d quota=%d", total, warm, quota)
+	}
+}

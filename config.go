@@ -32,6 +32,8 @@ type pluginConfig struct {
 	WarmAllowlist        []string       `json:"warm_allowlist,omitempty"`
 	ResetFollowupMode    string         `json:"reset_followup_mode"`
 	Schedule             string         `json:"schedule"`
+	QuotaRefreshSchedule string         `json:"quota_refresh_schedule,omitempty"`
+	QuotaCronSchedule    cron.Schedule  `json:"-"`
 	Timezone             string         `json:"timezone"`
 	Model                string         `json:"model"`
 	FallbackModel        string         `json:"fallback_model"`
@@ -48,6 +50,7 @@ type pluginConfig struct {
 
 type prewarmJob struct {
 	Name         string
+	QuotaOnly    bool
 	Schedule     string
 	Model        string
 	Prompt       string
@@ -75,6 +78,7 @@ type yamlPluginConfig struct {
 	SyncOnFirstUse       *bool            `yaml:"sync_on_first_use"` // Accepted for old CPA configs; intentionally ignored.
 	ResetFollowupMode    string           `yaml:"reset_followup_mode"`
 	Schedule             string           `yaml:"schedule"`
+	QuotaRefreshSchedule string           `yaml:"quota_refresh_schedule"`
 	Timezone             string           `yaml:"timezone"`
 	Model                string           `yaml:"model"`
 	FallbackModel        string           `yaml:"fallback_model"`
@@ -165,6 +169,7 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if value := strings.TrimSpace(input.Schedule); value != "" {
 		cfg.Schedule = value
 	}
+	cfg.QuotaRefreshSchedule = strings.TrimSpace(input.QuotaRefreshSchedule)
 	if value := strings.TrimSpace(input.Timezone); value != "" {
 		cfg.Timezone = value
 	}
@@ -254,6 +259,16 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		return cfg, fmt.Errorf("timezone: %w", err)
 	}
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	if cfg.QuotaRefreshSchedule != "" {
+		cfg.QuotaCronSchedule, err = parser.Parse(cfg.QuotaRefreshSchedule)
+		if err != nil {
+			return cfg, fmt.Errorf("quota_refresh_schedule must be a standard five-field cron expression: %w", err)
+		}
+		spec, ok := cfg.QuotaCronSchedule.(*cron.SpecSchedule)
+		if !ok || spec.Minute&(uint64(1)<<59) != 0 && spec.Hour&(uint64(1)<<23) != 0 {
+			return cfg, fmt.Errorf("quota_refresh_schedule at 23:59 would cross midnight after jitter")
+		}
+	}
 	if len(input.Jobs) > 0 && strings.TrimSpace(input.Schedule) != "" {
 		return cfg, fmt.Errorf("use either schedule or jobs, not both")
 	}
@@ -275,7 +290,7 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		seen := make(map[string]bool)
 		for _, item := range input.Jobs {
 			name := strings.TrimSpace(item.Name)
-			if !validJobName(name) || seen[name] {
+			if !validJobName(name) || name == quotaRefreshJobName || seen[name] {
 				return cfg, fmt.Errorf("job names must be unique and use 1-64 letters, digits, underscores or hyphens")
 			}
 			seen[name] = true
@@ -362,6 +377,7 @@ type publicConfig struct {
 	WarmAllowlist        []string    `json:"warm_allowlist,omitempty"`
 	ResetFollowupMode    string      `json:"reset_followup_mode"`
 	Schedule             string      `json:"schedule"`
+	QuotaRefreshSchedule string      `json:"quota_refresh_schedule,omitempty"`
 	Timezone             string      `json:"timezone"`
 	Model                string      `json:"model"`
 	FallbackModel        string      `json:"fallback_model"`
@@ -397,6 +413,7 @@ func (cfg pluginConfig) public() publicConfig {
 		WarmAllowlist:        append([]string(nil), cfg.WarmAllowlist...),
 		ResetFollowupMode:    cfg.ResetFollowupMode,
 		Schedule:             cfg.Schedule,
+		QuotaRefreshSchedule: cfg.QuotaRefreshSchedule,
 		Timezone:             cfg.Timezone,
 		Model:                cfg.Model,
 		FallbackModel:        cfg.FallbackModel,

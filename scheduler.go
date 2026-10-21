@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	followupDelay = 90 * time.Second
-	maxSlotAge    = 48 * time.Hour
+	quotaRefreshJobName = "quota-refresh"
+	followupDelay       = 90 * time.Second
+	maxSlotAge          = 48 * time.Hour
 )
 
 type scheduledSlot struct {
@@ -68,11 +69,32 @@ func latestCronSlot(schedule cron.Schedule, now time.Time) time.Time {
 	}
 }
 
-func (s *runtimeScheduler) bootstrap(cfg pluginConfig, now time.Time) {
+// Quota refresh is independent of automatic model prewarming.
+func scheduledJobs(cfg pluginConfig) []prewarmJob {
+	var jobs []prewarmJob
+	if cfg.AutomaticEnabled {
+		jobs = append(jobs, cfg.Jobs...)
+	}
+	if cfg.QuotaCronSchedule != nil {
+		jobs = append(jobs, prewarmJob{Name: quotaRefreshJobName, Schedule: cfg.QuotaRefreshSchedule, CronSchedule: cfg.QuotaCronSchedule, QuotaOnly: true})
+	}
+	return jobs
+}
+
+func quotaCoveredByPrewarm(cfg pluginConfig, base time.Time) bool {
+	if !cfg.AutomaticEnabled {
+		return false
+	}
 	for _, job := range cfg.Jobs {
-		if !cfg.AutomaticEnabled {
-			break
+		if job.CronSchedule.Next(base.Add(-time.Minute).In(cfg.Location)).Equal(base) {
+			return true
 		}
+	}
+	return false
+}
+
+func (s *runtimeScheduler) bootstrap(cfg pluginConfig, now time.Time) {
+	for _, job := range scheduledJobs(cfg) {
 		latest := latestCronSlot(job.CronSchedule, now.In(cfg.Location))
 		if !latest.IsZero() && sameLocalDate(latest, now, cfg.Location) && now.Sub(latest) <= 70*time.Minute {
 			s.planSlot(job, latest, now)
@@ -85,10 +107,19 @@ func (s *runtimeScheduler) bootstrap(cfg pluginConfig, now time.Time) {
 func (s *runtimeScheduler) planSlot(job prewarmJob, base, now time.Time) {
 	r := s.runtime
 	r.mu.RLock()
-	location := r.cfg.Location
+	cfg := r.cfg
+	location := cfg.Location
 	statePath := r.cfg.StatePath
 	r.mu.RUnlock()
-	if base.IsZero() || !inScheduleHour(base, location) {
+	// A daytime prewarm slot already queries all accounts. Advance to the next
+	// uncovered quota slot instead of issuing duplicate upstream queries.
+	for skipped := 0; job.QuotaOnly && !base.IsZero() && quotaCoveredByPrewarm(cfg, base); skipped++ {
+		if skipped >= 64 {
+			return
+		}
+		base = job.CronSchedule.Next(base.In(location))
+	}
+	if base.IsZero() || (!job.QuotaOnly && !inScheduleHour(base, location)) {
 		return
 	}
 	select {
@@ -123,7 +154,7 @@ func (s *runtimeScheduler) planSlot(job prewarmJob, base, now time.Time) {
 		r.setLastError("slot_state_write_failed")
 		return
 	}
-	logHost("info", "codex prewarm hourly slot planned", map[string]any{"job": job.Name, "slot": key, "jitter_seconds": jitter, "planned_at": base.Add(time.Duration(jitter) * time.Second)})
+	logHost("info", "codex prewarm or quota slot planned", map[string]any{"job": job.Name, "slot": key, "jitter_seconds": jitter, "planned_at": base.Add(time.Duration(jitter) * time.Second)})
 }
 
 func (s *runtimeScheduler) loop() {
@@ -153,31 +184,32 @@ func (s *runtimeScheduler) processDue(now time.Time) {
 		return
 	}
 	cfg := r.cfg
-	if !cfg.AutomaticEnabled {
+	if !cfg.AutomaticEnabled && cfg.QuotaCronSchedule == nil {
 		r.mu.Unlock()
 		return
 	}
 	jobs := make(map[string]prewarmJob, len(cfg.Jobs))
-	for _, job := range cfg.Jobs {
+	for _, job := range scheduledJobs(cfg) {
 		jobs[job.Name] = job
 	}
 	for key, slot := range r.state.Slots {
 		if !slot.StartedAt.IsZero() || slot.PlannedAt.After(now) || !sameLocalDate(slot.BaseAt, now, cfg.Location) || now.Sub(slot.BaseAt) > 70*time.Minute {
 			continue
 		}
-		if slot.BaseAt.In(cfg.Location).Hour() == 23 && now.After(slot.BaseAt.Add(2*time.Minute)) {
-			continue
-		}
 		job, exists := jobs[slot.Job]
-		if !exists {
+		if !exists || (!job.QuotaOnly && slot.BaseAt.In(cfg.Location).Hour() == 23 && now.After(slot.BaseAt.Add(2*time.Minute))) {
 			continue
 		}
 		slot.StartedAt = now.UTC()
 		previousSlots[key] = r.state.Slots[key]
 		r.state.Slots[key] = slot
-		requests = append(requests, runRequest{Trigger: "schedule", Job: job, Slot: key, SlotBase: slot.BaseAt, PlannedAt: slot.PlannedAt, JitterSeconds: slot.JitterSeconds})
+		trigger := "schedule"
+		if job.QuotaOnly {
+			trigger = "quota_refresh"
+		}
+		requests = append(requests, runRequest{Trigger: trigger, ReadOnly: job.QuotaOnly, Job: job, Slot: key, SlotBase: slot.BaseAt, PlannedAt: slot.PlannedAt, JitterSeconds: slot.JitterSeconds})
 	}
-	if cfg.ResetFollowupMode != "off" && inFollowupHours(now, cfg.Location) {
+	if cfg.AutomaticEnabled && cfg.ResetFollowupMode != "off" && inFollowupHours(now, cfg.Location) {
 		for account, window := range r.state.Accounts {
 			var due time.Time
 			var kinds []string
@@ -253,7 +285,7 @@ func (s *runtimeScheduler) processDue(now time.Time) {
 		}
 	}
 	for _, request := range requests {
-		if request.Trigger != "schedule" {
+		if request.Trigger != "schedule" && request.Trigger != "quota_refresh" {
 			continue
 		}
 		next := request.Job.CronSchedule.Next(request.SlotBase.In(cfg.Location))

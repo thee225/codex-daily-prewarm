@@ -186,7 +186,9 @@ func (r *runtime) recordNotifications(cfg pluginConfig, record *runRecord, notif
 	}
 	n.pruneWindowsBefore(record.FinishedAt.AddDate(0, 0, -7))
 	w := n.window(cfg, digestEnd(cfg, record.FinishedAt))
-	w.Runs++
+	if record.Trigger != "quota_refresh" {
+		w.Runs++
+	}
 	var immediate []failureNotice
 	deduplicated, queued := false, false
 	for _, item := range record.Accounts {
@@ -204,7 +206,9 @@ func (r *runtime) recordNotifications(cfg pluginConfig, record *runRecord, notif
 			a.QuotaCheckedAt = item.QuotaCheckedAt
 			a.WeeklyRemaining = 100 - item.Weekly.UsedPercent
 		}
-		if item.SkipReason != "" {
+		if item.SkipReason == "quota_refresh_only" {
+			// Successful read-only refreshes are not skipped prewarms.
+		} else if item.SkipReason != "" {
 			w.Skips[item.SkipReason]++
 		} else if unknownQuotaResult(item) {
 			reason := item.ErrorCode

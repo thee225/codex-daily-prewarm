@@ -289,7 +289,9 @@ const statusPageActionScript = `<script>
         '日报最近发送：' + (formatTime(state.notifications?.last_digest_at, state.config.timezone) || '暂无'),
         '日报结果：' + (state.notifications?.last_digest_result || '暂无'),
         '下次日报：' + (formatTime(state.notifications?.next_digest_at, state.config.timezone) || '未计划'),
-        '下次运行：' + (formatTime(state.next_run_at, state.config.timezone) || '未计划'),
+        '额度刷新计划：' + (state.config.quota_refresh_schedule === '*/30 * * * *' ? '全天每30分钟（只查额度）' : (state.config.quota_refresh_schedule || '随预热巡检')),
+        '下次额度刷新：' + (formatTime(state.next_quota_refresh_at, state.config.timezone) || '随预热巡检'),
+        '下次预热巡检：' + (formatTime(state.next_run_at, state.config.timezone) || '未计划'),
         '最近运行：' + (last ? [formatTime(last.finished_at, state.config.timezone), '查询 ' + last.quota_queried_accounts + '/' + last.discovered_accounts, '符合预热 ' + last.would_warm_accounts, '预热请求 ' + last.attempted_accounts, '预热成功 ' + last.succeeded_accounts, '跳过 ' + last.skipped_accounts, '失败 ' + (last.failed_accounts ?? 0), '错误 ' + (last.error_code || '无'), 'Bark ' + (last.bark_status || '无')].join(' · ') : '暂无'),
         '', '待执行账号补查：'
       ];

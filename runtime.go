@@ -117,19 +117,20 @@ type accountResult struct {
 }
 
 type runtimeStatus struct {
-	AccountDisplay accountDisplayState      `json:"account_display"`
-	Notifications  notificationStatus       `json:"notifications"`
-	Plugin         string                   `json:"plugin"`
-	Version        string                   `json:"version"`
-	Config         publicConfig             `json:"config"`
-	Running        bool                     `json:"running"`
-	NextRunAt      time.Time                `json:"next_run_at,omitempty"`
-	LastError      string                   `json:"last_error,omitempty"`
-	LastRun        *runRecord               `json:"last_run,omitempty"`
-	HistorySize    int                      `json:"history_size"`
-	NextRuns       []jobNextRun             `json:"next_runs,omitempty"`
-	LastSyncAt     time.Time                `json:"last_sync_at,omitempty"`
-	Accounts       map[string]accountWindow `json:"accounts,omitempty"`
+	AccountDisplay     accountDisplayState      `json:"account_display"`
+	Notifications      notificationStatus       `json:"notifications"`
+	Plugin             string                   `json:"plugin"`
+	Version            string                   `json:"version"`
+	Config             publicConfig             `json:"config"`
+	Running            bool                     `json:"running"`
+	NextQuotaRefreshAt time.Time                `json:"next_quota_refresh_at,omitempty"`
+	NextRunAt          time.Time                `json:"next_run_at,omitempty"`
+	LastError          string                   `json:"last_error,omitempty"`
+	LastRun            *runRecord               `json:"last_run,omitempty"`
+	HistorySize        int                      `json:"history_size"`
+	NextRuns           []jobNextRun             `json:"next_runs,omitempty"`
+	LastSyncAt         time.Time                `json:"last_sync_at,omitempty"`
+	Accounts           map[string]accountWindow `json:"accounts,omitempty"`
 }
 
 type jobNextRun struct {
@@ -266,13 +267,10 @@ func (r *runtime) configure(raw []byte) error {
 	r.stopCh = make(chan struct{})
 	r.lastError = ""
 	r.mu.Unlock()
-	if cfg.AutomaticEnabled || cfg.BarkURL != "" {
+	if cfg.AutomaticEnabled || cfg.QuotaCronSchedule != nil || cfg.BarkURL != "" {
 		scheduler := newRuntimeScheduler(r)
 		c := cron.New(cron.WithLocation(cfg.Location))
-		for _, job := range cfg.Jobs {
-			if !cfg.AutomaticEnabled {
-				break
-			}
+		for _, job := range scheduledJobs(cfg) {
 			job := job
 			if _, err := c.AddFunc(job.Schedule, func() {
 				scheduler.planSlot(job, latestCronSlot(job.CronSchedule, r.currentTime().In(cfg.Location)), r.currentTime())
@@ -364,7 +362,7 @@ func (r *runtime) requeueInterrupted(request runRequest) {
 	r.mu.Lock()
 	changed := false
 	switch request.Trigger {
-	case "schedule":
+	case "schedule", "quota_refresh":
 		if slot, exists := r.state.Slots[request.Slot]; exists && !slot.StartedAt.IsZero() {
 			slot.StartedAt = time.Time{}
 			r.state.Slots[request.Slot] = slot
@@ -489,6 +487,7 @@ func (r *runtime) runQueue(request runRequest) {
 }
 
 func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRecord) {
+	request.ReadOnly = request.ReadOnly || request.Trigger == "quota_refresh"
 	r.mu.RLock()
 	stop := r.stopCh
 	initialWriteFailures := r.stateWriteFailures
@@ -595,7 +594,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 			if reason == "" && request.TargetAccount == "" {
 				r.clearQuotaRetry(cfg, fingerprint)
 			}
-			if reason == "" {
+			if reason == "" && !request.ReadOnly {
 				reason = quotaCandidateReason(first)
 				if reason == "" {
 					if limitReason := r.warmLimitReason(fingerprint, time.Now()); limitReason != "" {
@@ -644,6 +643,9 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 		if reason == "interrupted" {
 			record.ErrorCode = "interrupted"
 			return record
+		}
+		if reason == "" && request.ReadOnly {
+			reason = "quota_refresh_only"
 		}
 		if reason == "" {
 			result.WouldWarm = true
@@ -1325,6 +1327,9 @@ func (r *runtime) status() runtimeStatus {
 	for account, window := range r.state.Accounts {
 		window.AttemptTimes = recentAttempts(window.AttemptTimes, time.Now())
 		status.Accounts[account] = window
+	}
+	if r.cfg.QuotaCronSchedule != nil && r.cfg.Location != nil {
+		status.NextQuotaRefreshAt = r.cfg.QuotaCronSchedule.Next(r.currentTime().In(r.cfg.Location))
 	}
 	if r.cfg.AutomaticEnabled && r.cfg.Location != nil {
 		for _, job := range r.cfg.Jobs {

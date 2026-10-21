@@ -18,7 +18,7 @@ import (
 // Exercise the real quota parser, confirmation, model execution and persistence
 // together. Only the native host transport is replaced; no production requests.
 func TestWholeRunResults(t *testing.T) {
-	for _, mode := range []string{"success", "fallback", "no_headers", "quota_429", "dry_run", "observe", "all_query_failed", "partial_query_failed", "state_failed", "final_state_failed"} {
+	for _, mode := range []string{"success", "quota_refresh", "quota_refresh_failed", "fallback", "no_headers", "quota_429", "dry_run", "observe", "all_query_failed", "partial_query_failed", "state_failed", "final_state_failed"} {
 		t.Run(mode, func(t *testing.T) {
 			r := newRuntime()
 			cfg := r.cfg
@@ -49,7 +49,7 @@ func TestWholeRunResults(t *testing.T) {
 					return encode(authListResponse{Files: auths})
 				case pluginabi.MethodHostAuthGet:
 					req := payload.(pluginapi.HostAuthGetRequest)
-					if mode == "all_query_failed" || mode == "partial_query_failed" && req.AuthIndex == "a" {
+					if mode == "quota_refresh_failed" || mode == "all_query_failed" || mode == "partial_query_failed" && req.AuthIndex == "a" {
 						return nil, errors.New("synthetic failure")
 					}
 					return encode(pluginapi.HostAuthGetResponse{JSON: []byte(`{"access_token":"test-only","account_id":"fixture"}`)})
@@ -93,12 +93,23 @@ func TestWholeRunResults(t *testing.T) {
 					return nil, errors.New("unexpected method")
 				}
 			}
-			got := r.executeRun(cfg, runRequest{Trigger: "manual", Job: cfg.Jobs[0], ObserveOnly: mode == "observe"})
+			trigger := "manual"
+			if mode == "quota_refresh" || mode == "quota_refresh_failed" {
+				trigger = "quota_refresh"
+			}
+			got := r.executeRun(cfg, runRequest{Trigger: trigger, Job: cfg.Jobs[0], ObserveOnly: mode == "observe"})
 			if got.FinishedAt.IsZero() {
 				t.Fatal("returned record was not finalized")
 			}
 			switch mode {
-			case "all_query_failed", "state_failed":
+			case "quota_refresh":
+				if !got.Success || got.WouldWarm != 0 || got.Skipped != 1 || calls != 0 || got.Accounts[0].SkipReason != "quota_refresh_only" || r.attemptCount(accountFingerprint("a"), time.Now()) != 0 {
+					t.Fatalf("read-only refresh invoked warm path: %+v calls=%d", got, calls)
+				}
+				if got.Accounts[0].QuotaStatus != "confirmed" || r.accountWindow(accountFingerprint("a")).LastQuotaCheckedAt.IsZero() {
+					t.Fatal("read-only refresh did not persist quota")
+				}
+			case "quota_refresh_failed", "all_query_failed", "state_failed":
 				if got.Success || got.Failed != 1 || got.Skipped != 0 || calls != 0 || got.ErrorCode == "" {
 					t.Fatalf("failure masked: %+v calls=%d", got, calls)
 				}
