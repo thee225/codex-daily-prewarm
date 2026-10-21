@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= codex-daily-prewarm
-VERSION ?= 0.7.1
+VERSION ?= 0.7.2
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

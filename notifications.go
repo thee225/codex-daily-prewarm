@@ -298,7 +298,7 @@ func (r *runtime) sendNotification(cfg pluginConfig, title, body, level string) 
 	if send == nil {
 		send = sendBarkHTTP
 	}
-	return sendBarkWith(cfg, title, body, level, send)
+	return sendBarkWith(cfg, title, r.displayNotification(body), level, send)
 }
 
 func (r *runtime) persistNotificationResult(cfg pluginConfig) {

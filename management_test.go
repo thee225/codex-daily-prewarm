@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +15,7 @@ import (
 
 func TestManagementRegistration(t *testing.T) {
 	registration := managementRegistration()
-	if len(registration.Resources) != 1 || len(registration.Routes) != 4 {
+	if len(registration.Resources) != 1 || len(registration.Routes) != 5 {
 		t.Fatalf("registration = %#v", registration)
 	}
 }
@@ -97,6 +99,10 @@ func TestStatusPageDisplaysConfiguredTimezone(t *testing.T) {
 }
 
 func TestAccountDetailsRemainSeparateFromState(t *testing.T) {
+	oldApp := app
+	app = newRuntime()
+	defer func() { app = oldApp }()
+	app.cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	old := callHost
 	defer func() { callHost = old }()
 	calls := 0
@@ -125,7 +131,7 @@ func TestAccountDetailsRemainSeparateFromState(t *testing.T) {
 			t.Fatal("names loaded outside explicit authenticated details route")
 		}
 	}
-	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/codex-daily-prewarm/account-details"})
+	response := dispatchManagement(pluginapi.ManagementRequest{Method: http.MethodPut, Path: "/v0/management/plugins/codex-daily-prewarm/account-details", Body: []byte(`{"enabled":true}`)})
 	var body struct {
 		Accounts map[string]accountDisplayDetail `json:"accounts"`
 	}
@@ -160,5 +166,56 @@ func TestAccountDisplayPlanFailureIsUnknown(t *testing.T) {
 		if got := accountDisplayPlan(pluginapi.HostAuthFileEntry{AuthIndex: "fixture", AccountType: "oauth"}); got != "" {
 			t.Fatalf("invalid metadata guessed plan: %s", got)
 		}
+	}
+}
+
+func TestGlobalAccountDisplayPersistsAndControlsAllNotificationBodies(t *testing.T) {
+	r := newRuntime()
+	r.cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	id := "acct-111111111111"
+	on := accountDisplayState{Enabled: true, Accounts: map[string]accountDisplayDetail{id: {Name: "same@example.com", AccountType: "team"}}}
+	if err := r.saveAccountDisplay(on); err != nil {
+		t.Fatal(err)
+	}
+	disk, err := readState(r.cfg.StatePath)
+	if err != nil || !disk.AccountDisplay.Enabled {
+		t.Fatal("preference not persisted")
+	}
+	for _, body := range []string{id + " · active_five_hour_window", id + " 预热 2 次", id + " · 连续 3 轮额度未知"} {
+		if got := r.displayNotification(body); !strings.Contains(got, "same@example.com · Team") || !strings.Contains(got, id) {
+			t.Fatalf("name missing: %s", got)
+		}
+	}
+
+	cfg := r.cfg
+	cfg.BarkURL = "https://example.com/test-only"
+	r.barkSend = func(req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		var body map[string]string
+		if json.Unmarshal(req.Body, &body) != nil || !strings.Contains(body["body"], "same@example.com · Team") {
+			t.Fatal("serialized Bark lost display name")
+		}
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200}`)}, nil
+	}
+	for _, title := range []string{"Codex 预热结果", "Codex 预热失败", "Codex 预热日报", "Codex 夜间预热失败汇总"} {
+		if got := r.sendNotification(cfg, title, id, "active"); got != "accepted" {
+			t.Fatal(got)
+		}
+	}
+	if err := r.setAccountDisplay(false); err != nil {
+		t.Fatal(err)
+	}
+	disk, err = readState(r.cfg.StatePath)
+	if err != nil || disk.AccountDisplay.Enabled || len(disk.AccountDisplay.Accounts) > 0 {
+		t.Fatal("disabled cache retained names")
+	}
+	if got := r.displayNotification(id); got != id {
+		t.Fatal("disabled notifications retained names")
+	}
+	r.cfg.StatePath = filepath.Join(t.TempDir(), "not-a-file")
+	if err := os.Mkdir(r.cfg.StatePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.saveAccountDisplay(on); err == nil || r.accountDisplay().Enabled {
+		t.Fatal("failed write changed preference")
 	}
 }

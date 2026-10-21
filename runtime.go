@@ -26,13 +26,14 @@ const (
 )
 
 type runtimeState struct {
-	Notifications notificationState          `json:"notifications,omitempty"`
-	Version       int                        `json:"version"`
-	Daily         map[string]map[string]bool `json:"daily,omitempty"`
-	Accounts      map[string]accountWindow   `json:"accounts,omitempty"`
-	Slots         map[string]scheduledSlot   `json:"slots,omitempty"`
-	History       []runRecord                `json:"history,omitempty"`
-	LastSyncAt    time.Time                  `json:"last_sync_at,omitempty"`
+	AccountDisplay accountDisplayState        `json:"account_display"`
+	Notifications  notificationState          `json:"notifications,omitempty"`
+	Version        int                        `json:"version"`
+	Daily          map[string]map[string]bool `json:"daily,omitempty"`
+	Accounts       map[string]accountWindow   `json:"accounts,omitempty"`
+	Slots          map[string]scheduledSlot   `json:"slots,omitempty"`
+	History        []runRecord                `json:"history,omitempty"`
+	LastSyncAt     time.Time                  `json:"last_sync_at,omitempty"`
 }
 
 // The old daily map remains readable for rollback, but decisions use the
@@ -116,18 +117,19 @@ type accountResult struct {
 }
 
 type runtimeStatus struct {
-	Notifications notificationStatus       `json:"notifications"`
-	Plugin        string                   `json:"plugin"`
-	Version       string                   `json:"version"`
-	Config        publicConfig             `json:"config"`
-	Running       bool                     `json:"running"`
-	NextRunAt     time.Time                `json:"next_run_at,omitempty"`
-	LastError     string                   `json:"last_error,omitempty"`
-	LastRun       *runRecord               `json:"last_run,omitempty"`
-	HistorySize   int                      `json:"history_size"`
-	NextRuns      []jobNextRun             `json:"next_runs,omitempty"`
-	LastSyncAt    time.Time                `json:"last_sync_at,omitempty"`
-	Accounts      map[string]accountWindow `json:"accounts,omitempty"`
+	AccountDisplay accountDisplayState      `json:"account_display"`
+	Notifications  notificationStatus       `json:"notifications"`
+	Plugin         string                   `json:"plugin"`
+	Version        string                   `json:"version"`
+	Config         publicConfig             `json:"config"`
+	Running        bool                     `json:"running"`
+	NextRunAt      time.Time                `json:"next_run_at,omitempty"`
+	LastError      string                   `json:"last_error,omitempty"`
+	LastRun        *runRecord               `json:"last_run,omitempty"`
+	HistorySize    int                      `json:"history_size"`
+	NextRuns       []jobNextRun             `json:"next_runs,omitempty"`
+	LastSyncAt     time.Time                `json:"last_sync_at,omitempty"`
+	Accounts       map[string]accountWindow `json:"accounts,omitempty"`
 }
 
 type jobNextRun struct {
@@ -155,6 +157,7 @@ type runRequest struct {
 }
 
 type runtime struct {
+	displayMu          sync.Mutex
 	notificationMu     sync.Mutex
 	now                func() time.Time
 	barkSend           barkSender
@@ -530,6 +533,7 @@ func (r *runtime) executeRun(cfg pluginConfig, request runRequest) (record runRe
 		return record
 	}
 
+	r.refreshAccountDisplay()
 	auths, err := listCodexAuths()
 	if err != nil {
 		record.ErrorCode = "auth_inventory_unavailable"
@@ -1313,8 +1317,9 @@ func (r *runtime) status() runtimeStatus {
 	defer r.mu.RUnlock()
 	status := runtimeStatus{
 		Plugin: pluginName, Version: pluginVersion, Config: r.cfg.public(), Running: r.running,
-		Notifications: r.state.Notifications.status(r.cfg, r.currentTime()),
-		LastError:     r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
+		AccountDisplay: cloneAccountDisplay(r.state.AccountDisplay),
+		Notifications:  r.state.Notifications.status(r.cfg, r.currentTime()),
+		LastError:      r.lastError, HistorySize: len(r.state.History), LastSyncAt: r.state.LastSyncAt,
 		Accounts: make(map[string]accountWindow, len(r.state.Accounts)),
 	}
 	for account, window := range r.state.Accounts {
@@ -1459,6 +1464,7 @@ func writeState(path string, state runtimeState) error {
 
 func cloneState(state runtimeState) runtimeState {
 	clone := runtimeState{Version: state.Version, Daily: make(map[string]map[string]bool), Accounts: make(map[string]accountWindow), Slots: make(map[string]scheduledSlot), History: append([]runRecord(nil), state.History...), LastSyncAt: state.LastSyncAt}
+	clone.AccountDisplay = cloneAccountDisplay(state.AccountDisplay)
 	clone.Notifications = cloneNotifications(state.Notifications)
 	for date, accounts := range state.Daily {
 		clone.Daily[date] = make(map[string]bool, len(accounts))

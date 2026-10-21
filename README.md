@@ -63,8 +63,8 @@ plugins:
 
 - `GET /v0/resource/plugins/codex-daily-prewarm/status`：公开入口只提供中文页面壳和全局模型名；逐账号额度、补查与最近运行结果通过需认证的管理状态接口加载。面板选择“记住密钥”后，插件页从同源的 `cli-proxy-auth` 登录存储中读取密钥并自动显示详情；未选择时浏览器不持久化密钥，页面无法自动取得面板内存中的登录态，可点击“验证并查看详情”只读加载，输入仅用于本页、不保存。页面另有“一键预热”按钮，立刻查询全部账号额度并按现有条件尝试预热；完成后即时发一条结果 Bark。按钮调用始终需要 CPA 管理认证。
 - `GET /v0/management/plugins/codex-daily-prewarm/status`：状态 JSON，包含匿名账号的额度和滚动调用记录。
-- 页面“显示账户详情”开关默认关闭，偏好仅保存在当前浏览器；开启后通过认证接口按“自定义标签 → 邮箱 → 认证文件名”取显示名称，并附 Plus/Team 等套餐和原匿名指纹，同邮箱不同套餐仍可区分。套餐未知时显示“未知套餐”，已移除账户或名称查询失败时回退指纹；不触发额度查询或模型请求。真实名称不写入运行状态、历史、audit 或 Bark。
-- `GET /v0/management/plugins/codex-daily-prewarm/account-details`：需管理认证，只返回指纹到显示名称、套餐的映射；公开页面和原状态/历史接口仍不包含真实名称。
+- 页面“显示账户详情”为服务端持久化的全局开关，默认关闭。开启后网页、手动结果、失败/夜间告警、每日日报及只读摘要共用“标签 → 邮箱 → 认证文件名”与 Plus/Team 套餐；内部指纹、限额和去重标识不变。网页每30秒刷新，Mac与CYD各60秒刷新，通常两分钟内跟随。关闭时从当前状态删除名称缓存，新通知和摘要恢复匿名；已发出的 Bark 历史无法撤回。
+- `GET /v0/management/plugins/codex-daily-prewarm/account-details`：读取全局 `{enabled,accounts}`；`PUT` 接收 `{"enabled":true/false}` 保存设置，均需管理认证。保存失败不改变已确认设置。开启时本地读取受控名称/套餐元数据并在自然巡检时刷新，不查上游、不触发模型调用；运行记录和audit仍匿名。名称缓存仅写入0600状态文件中的 `account_display`，供受保护摘要服务读取；不包含Token。
 - `GET /v0/management/plugins/codex-daily-prewarm/history`：最近 30 次巡检。
 - `POST /v0/management/plugins/codex-daily-prewarm/run-now`：手动发起一轮，仍受额度证据、dry-run 与次数保护；传入 `{"notify":true}` 即时发送结果 Bark（包括无成功、失败或跳过）。
 
@@ -80,7 +80,7 @@ plugins:
 
 ```bash
 make test
-make build GOOS=linux GOARCH=amd64 VERSION=0.7.1
+make build GOOS=linux GOARCH=amd64 VERSION=0.7.2
 ```
 
 页面状态回归检查（需要 Node.js）：`node tests/status-page.mjs`。Go 整轮执行测试使用模拟宿主，不访问生产服务、不消耗模型额度。
